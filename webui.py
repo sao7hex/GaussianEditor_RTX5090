@@ -140,8 +140,9 @@ class WebUI:
         self.sam_predictor = self.text_segmentor.model.sam
         self.sam_predictor.is_image_set = True
         self.sam_features = {}
-        self.semantic_gauassian_masks = {}
-        self.semantic_gauassian_masks["ALL"] = torch.ones_like(self.gaussian._opacity)
+        self.semantic_gauassian_masks["ALL"] = torch.ones(
+            self.gaussian._xyz.shape[0], dtype=torch.bool, device="cuda"
+        )
 
         self.parser = ArgumentParser(description="Training script parameters")
         self.pipe = PipelineParams(self.parser)
@@ -546,6 +547,8 @@ class WebUI:
                     save_mask=True
                 )
 
+            if semantic_gaussian_mask.ndim > 1:
+                semantic_gaussian_mask = semantic_gaussian_mask.squeeze()
             self.semantic_gauassian_masks[text_prompt] = semantic_gaussian_mask
             if text_prompt not in self.semantic_groups.options:
                 self.semantic_groups.options += (text_prompt,)
@@ -553,7 +556,22 @@ class WebUI:
 
         @self.semantic_groups.on_update
         def _(_):
-            semantic_mask = self.semantic_gauassian_masks[self.semantic_groups.value]
+            val = self.semantic_groups.value
+            if val not in self.semantic_gauassian_masks:
+                return
+            semantic_mask = self.semantic_gauassian_masks[val]
+            if semantic_mask is None:
+                return
+            if semantic_mask.ndim > 1:
+                semantic_mask = semantic_mask.squeeze()
+            if semantic_mask.shape[0] != self.gaussian._xyz.shape[0]:
+                print(
+                    f"[Warning] Mask size ({semantic_mask.shape[0]}) does not match Gaussian size ({self.gaussian._xyz.shape[0]}). Resetting mask."
+                )
+                semantic_mask = torch.ones(
+                    self.gaussian._xyz.shape[0], dtype=torch.bool, device="cuda"
+                )
+                self.semantic_gauassian_masks[val] = semantic_mask
             self.gaussian.set_mask(semantic_mask)
             self.gaussian.apply_grad_mask(semantic_mask)
 
@@ -776,13 +794,18 @@ class WebUI:
             self.gaussian.apply_weights(cur_cam, weights, weights_cnt, mask)
 
         weights /= weights_cnt + 1e-7
+        self.seg_scale = True
+        self.seg_scale_end = False
+        selected_mask = (weights > self.mask_thres.value)[:, 0]
+        self.gaussian.set_mask(selected_mask)
+        self.gaussian.apply_grad_mask(selected_mask)
+
         self.seg_scale_end_button.visible = True
         self.mask_thres.visible = True
         self.show_semantic_mask.value = True
         while True:
             if self.seg_scale:
-                selected_mask = weights > self.mask_thres.value
-                selected_mask = selected_mask[:, 0]
+                selected_mask = (weights > self.mask_thres.value)[:, 0]
                 self.gaussian.set_mask(selected_mask)
                 self.gaussian.apply_grad_mask(selected_mask)
 
@@ -925,14 +948,18 @@ class WebUI:
             masks.append(mask)
 
         weights /= weights_cnt + 1e-7
+        self.seg_scale = True
+        self.seg_scale_end = False
+        selected_mask = (weights > self.mask_thres.value)[:, 0]
+        self.gaussian.set_mask(selected_mask)
+        self.gaussian.apply_grad_mask(selected_mask)
 
         self.seg_scale_end_button.visible = True
         self.mask_thres.visible = True
         self.show_semantic_mask.value = True
         while True:
             if self.seg_scale:
-                selected_mask = weights > self.mask_thres.value
-                selected_mask = selected_mask[:, 0]
+                selected_mask = (weights > self.mask_thres.value)[:, 0]
                 self.gaussian.set_mask(selected_mask)
                 self.gaussian.apply_grad_mask(selected_mask)
 

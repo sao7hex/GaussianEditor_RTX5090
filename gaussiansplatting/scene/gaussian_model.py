@@ -832,10 +832,16 @@ class GaussianModel:
         )
 
     def set_mask(self, mask):
+        if mask.ndim > 1:
+            mask = mask.squeeze()
         self.mask = mask
 
     def apply_grad_mask(self, mask):
-        assert self.mask.shape[0] == self._xyz.shape[0]
+        if mask.ndim > 1:
+            mask = mask.squeeze()
+        if mask.shape[0] != self._xyz.shape[0]:
+            print(f"[Warning] Mask shape ({mask.shape[0]}) does not match XYZ shape ({self._xyz.shape[0]}). Resetting mask.")
+            mask = torch.ones(self._xyz.shape[0], dtype=torch.bool, device=self._xyz.device)
         self.set_mask(mask)
 
         def hook(grad):
@@ -848,6 +854,8 @@ class GaussianModel:
 
         fields = ["_xyz", "_features_dc", "_features_rest", "_opacity", "_scaling"]
 
+        if hasattr(self, "hooks"):
+            self.remove_grad_mask()
         self.hooks = []
 
         for field in fields:
