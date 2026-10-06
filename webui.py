@@ -140,6 +140,7 @@ class WebUI:
         self.sam_predictor = self.text_segmentor.model.sam
         self.sam_predictor.is_image_set = True
         self.sam_features = {}
+        self.semantic_gauassian_masks = {}
         self.semantic_gauassian_masks["ALL"] = torch.ones(
             self.gaussian._xyz.shape[0], dtype=torch.bool, device="cuda"
         )
