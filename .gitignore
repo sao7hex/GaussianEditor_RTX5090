@@ -202,3 +202,5 @@ exp/
 !threestudio/data
 !threestudio/utils/wonder3D/mvdiffusion/data
 tmp_add/
+dataset/
+ui_result/

@@ -5,7 +5,7 @@ jaxtyping
 typeguard
 nerfacc==0.3.3
 pyrender
-# git+https://github.com/NVlabs/tiny-cuda-nn/#subdirectory=bindings/torch
+git+https://github.com/NVlabs/tiny-cuda-nn/#subdirectory=bindings/torch
 diffusers[torch]==0.19.3
 transformers==4.28.1
 accelerate
@@ -14,7 +14,7 @@ tensorboard
 matplotlib
 imageio>=2.28.0
 imageio[ffmpeg]
-# git+https://github.com/NVlabs/nvdiffrast.git
+git+https://github.com/NVlabs/nvdiffrast.git
 libigl
 xatlas
 trimesh[easy]
@@ -27,7 +27,7 @@ git+https://github.com/ashawkey/envlight.git
 torchmetrics
 
 # deepfloyd
-# xformers==0.0.22.post7+cu118
+xformers==0.0.22.post7+cu118
 bitsandbytes==0.38.1
 sentencepiece
 safetensors
@@ -55,15 +55,15 @@ ninja
 easydict
 albumentations==0.5.2
 webdataset
-# git+https://github.com/luca-medeiros/lang-segment-anything.git@134a48a81ebd691686187ecce2d016fb327a8852
+git+https://github.com/luca-medeiros/lang-segment-anything.git
 
 
 #wonder3d
 nerfacc==0.3.3
 pyrender==0.1.45
-# Pillow==9.5.0
+Pillow==9.5.0
 
 
 # gaussian splatting
-# gaussiansplatting/submodules/diff-gaussian-rasterization
-# gaussiansplatting/submodules/simple-knn
+gaussiansplatting/submodules/diff-gaussian-rasterization
+gaussiansplatting/submodules/simple-knn
