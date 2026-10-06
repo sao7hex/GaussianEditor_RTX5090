@@ -800,32 +800,29 @@ class WebUI:
     def camera(self):
         if len(list(self.server.get_clients().values())) == 0:
             return None
+        client = list(self.server.get_clients().values())[0]
+        viser_cam = client.camera
+
+        aspect = viser_cam.aspect
+        if aspect is None or aspect <= 0:
+            aspect = 1.0
+        self.aspect = aspect
+
         if self.render_cameras is None and self.colmap_dir is not None:
-            self.aspect = list(self.server.get_clients().values())[0].camera.aspect
             self.render_cameras = CamScene(
                 self.colmap_dir, h=-1, w=-1, aspect=self.aspect
             ).cameras
-            self.begin_call(list(self.server.get_clients().values())[0])
-        viser_cam = list(self.server.get_clients().values())[0].camera
-        # viser_cam.up_direction = tf.SO3(viser_cam.wxyz) @ np.array([0.0, -1.0, 0.0])
-        # viser_cam.look_at = viser_cam.position
+            if hasattr(self, "begin_call"):
+                self.begin_call(client)
+
         R = tf.SO3(viser_cam.wxyz).as_matrix()
         T = -R.T @ viser_cam.position
-        # T = viser_cam.position
-        if self.render_cameras is None:
-            fovy = viser_cam.fov * self.FoV_slider.value
-        else:
-            fovy = self.render_cameras[0].FoVy * self.FoV_slider.value
 
-        fovx = 2 * math.atan(math.tan(fovy / 2) * self.aspect)
-        # fovy = self.render_cameras[0].FoVy
-        # fovx = self.render_cameras[0].FoVx
-        # math.tan(self.render_cameras[0].FoVx / 2) / math.tan(self.render_cameras[0].FoVy / 2)
-        # math.tan(fovx/2) / math.tan(fovy/2)
+        fovy = viser_cam.fov * self.FoV_slider.value
+        fovx = 2 * math.atan(math.tan(fovy / 2) * aspect)
 
-        # aspect = viser_cam.aspect
         width = int(self.resolution_slider.value)
-        height = int(width / self.aspect)
+        height = int(width / aspect)
         return Simple_Camera(0, R, T, fovx, fovy, height, width, "", 0)
 
     def click_cb(self, pointer):
