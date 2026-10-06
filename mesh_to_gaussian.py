@@ -11,7 +11,7 @@ import os
 import sys
 import argparse
 import math
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
 import numpy as np
 import torch
@@ -64,6 +64,55 @@ def inverse_sigmoid(x: np.ndarray) -> np.ndarray:
 # 1. メッシュ読み込みおよび表面点群サンプリング (OBJ, PLY, GLTF/GLB, STL対応)
 # ==============================================================================
 
+def split_submeshes_by_material(mesh: trimesh.Trimesh) -> List[trimesh.Trimesh]:
+    """
+    メッシュ内に複数マテリアル (face_materials) が存在する場合、
+    マテリアルごとにサブメッシュに分割する。
+    """
+    if not hasattr(mesh, "visual") or mesh.visual is None:
+        return [mesh]
+
+    face_materials = getattr(mesh.visual, "face_materials", None)
+    if face_materials is None:
+        return [mesh]
+
+    try:
+        if len(face_materials) != len(mesh.faces):
+            return [mesh]
+        unique_mats = np.unique(face_materials)
+        if len(unique_mats) <= 1:
+            return [mesh]
+
+        sub_list = []
+        materials = getattr(mesh.visual.material, "materials", None)
+
+        for mat_idx in unique_mats:
+            face_mask = (face_materials == mat_idx)
+            face_indices = np.where(face_mask)[0]
+            if len(face_indices) == 0:
+                continue
+
+            sub = mesh.submesh([face_indices], append=False)
+            if isinstance(sub, list) and len(sub) > 0:
+                sub_mesh = sub[0]
+            else:
+                sub_mesh = sub
+
+            # マテリアル情報の引き継ぎ
+            if materials is not None and 0 <= mat_idx < len(materials):
+                sub_mesh.visual.material = materials[mat_idx]
+
+            if len(sub_mesh.vertices) > 0 and len(sub_mesh.faces) > 0:
+                sub_list.append(sub_mesh)
+
+        if len(sub_list) > 0:
+            return sub_list
+    except Exception:
+        pass
+
+    return [mesh]
+
+
 def mesh_has_texture(mesh: trimesh.Trimesh, external_texture_img: Optional[Image.Image] = None) -> bool:
     """
     メッシュが画像テクスチャ（埋め込みまたは外部）およびUV座標を持っているかを判定する。
@@ -81,6 +130,12 @@ def mesh_has_texture(mesh: trimesh.Trimesh, external_texture_img: Optional[Image
             return True
         if hasattr(mat, "baseColorTexture") and mat.baseColorTexture is not None:
             return True
+        if hasattr(mat, "materials") and mat.materials is not None:
+            for m in mat.materials:
+                if hasattr(m, "image") and m.image is not None:
+                    return True
+                if hasattr(m, "baseColorTexture") and m.baseColorTexture is not None:
+                    return True
 
     return False
 
@@ -90,15 +145,17 @@ def sample_colors_from_submesh(
     points: np.ndarray,
     face_indices: np.ndarray,
     external_texture_img: Optional[Image.Image] = None,
-    default_color: Tuple[float, float, float] = (0.8, 0.8, 0.8)
-) -> np.ndarray:
+    default_color: Tuple[float, float, float] = (0.8, 0.8, 0.8),
+    alpha_threshold: float = 0.1
+) -> Tuple[np.ndarray, np.ndarray]:
     """
     サブメッシュからUV・テクスチャ・頂点カラー・マテリアル色を考慮して色をサンプリング。
+    同時にテクスチャから正常に色が取得できたかのマスク (has_texture_mask) も返す。
     GLTFのPBRマテリアル (baseColorTexture, baseColorFactor) にも対応。
     """
     n_pts = points.shape[0]
     if n_pts == 0:
-        return np.empty((0, 3), dtype=np.float32)
+        return np.empty((0, 3), dtype=np.float32), np.empty(0, dtype=bool)
 
     # 1. テクスチャ画像の探索
     tex_img = external_texture_img
@@ -106,12 +163,12 @@ def sample_colors_from_submesh(
     base_factor = None
 
     if tex_img is None and mat is not None:
-        # 一般的なテクスチャ
+        # 一般的なテクスチャ (RGBA形式でアルファ透明度を保持)
         if hasattr(mat, "image") and mat.image is not None:
-            tex_img = mat.image.convert("RGB")
+            tex_img = mat.image.convert("RGBA")
         # GLTF PBR Material の baseColorTexture
         elif hasattr(mat, "baseColorTexture") and mat.baseColorTexture is not None:
-            tex_img = mat.baseColorTexture.convert("RGB")
+            tex_img = mat.baseColorTexture.convert("RGBA")
 
         # baseColorFactor の取得
         if hasattr(mat, "baseColorFactor") and mat.baseColorFactor is not None:
@@ -137,6 +194,12 @@ def sample_colors_from_submesh(
             uvs = mesh.visual.uv[faces]
             sampled_uvs = np.sum(uvs * barycentric[:, :, None], axis=1)
 
+            # UV座標の有限性チェック
+            valid_uv = np.all(np.isfinite(sampled_uvs), axis=1)
+
+            # 面の全頂点UVが (0, 0) である未展開ポリゴンの検出 (除外フラグ)
+            is_zero_uv = np.all(np.abs(uvs) < 1e-5, axis=(1, 2))
+
             # テクスチャサンプリング (反転・リピート考慮)
             u = np.clip(sampled_uvs[:, 0] % 1.0, 0.0, 1.0) * (tex_w - 1)
             v = np.clip((1.0 - (sampled_uvs[:, 1] % 1.0)), 0.0, 1.0) * (tex_h - 1)
@@ -147,9 +210,18 @@ def sample_colors_from_submesh(
             if base_factor is not None:
                 colors = colors * base_factor
 
-            return colors.astype(np.float32)
+            has_texture_mask = valid_uv & (~is_zero_uv)
+            # アルファチャンネルが存在する場合、透明部分はテクスチャなしと判定
+            if tex_np.shape[2] >= 4:
+                alphas = tex_np[v_idx, u_idx, 3]
+                has_texture_mask = has_texture_mask & (alphas >= alpha_threshold)
+
+            return colors.astype(np.float32), has_texture_mask
         except Exception as e:
             print(f"[Warning] テクスチャサンプリング失敗: {e}. 代替カラーを試行します。")
+
+    # テクスチャ画像がない、またはサンプリング失敗時のフォールバック
+    has_texture_mask = np.zeros(n_pts, dtype=bool)
 
     # 3. 頂点カラーからのサンプリング
     if hasattr(mesh.visual, "vertex_colors") and mesh.visual.vertex_colors is not None and len(mesh.visual.vertex_colors) > 0:
@@ -161,16 +233,16 @@ def sample_colors_from_submesh(
             tri_verts = mesh.vertices[faces]
             barycentric = trimesh.triangles.points_to_barycentric(tri_verts, points)
             colors = np.sum(v_colors[faces] * barycentric[:, :, None], axis=1)
-            return colors.astype(np.float32)
+            return colors.astype(np.float32), has_texture_mask
         except Exception as e:
             print(f"[Warning] 頂点カラー取得失敗: {e}")
 
     # 4. マテリアルの単色（baseColorFactor または diffuse）
     if base_factor is not None:
-        return np.full((n_pts, 3), base_factor, dtype=np.float32)
+        return np.full((n_pts, 3), base_factor, dtype=np.float32), has_texture_mask
 
     # 5. デフォルト色
-    return np.full((n_pts, 3), default_color, dtype=np.float32)
+    return np.full((n_pts, 3), default_color, dtype=np.float32), has_texture_mask
 
 
 def sample_mesh_surface(
@@ -186,7 +258,7 @@ def sample_mesh_surface(
     GLTFなどの階層ノードやトランスフォーム、複数マテリアルに対応。
 
     Args:
-        only_textured: Trueの場合、テクスチャを持たないメッシュを完全に無視・除外する。
+        only_textured: Trueの場合、テクスチャを持たないメッシュおよび同一メッシュ内のテクスチャ未設定部分を完全に無視・除外する。
 
     Returns:
         points: (N, 3) 頂点座標
@@ -196,29 +268,34 @@ def sample_mesh_surface(
     if not HAS_TRIMESH:
         raise ImportError("メッシュ読み込みには trimesh が必要です。'pip install trimesh' を実行してください。")
 
-    # 外部テクスチャが指定されている場合はロード
+    # 外部テクスチャが指定されている場合はロード (RGBA形式でアルファ情報を保持)
     ext_tex_img = None
     if external_texture_path and os.path.exists(external_texture_path):
-        ext_tex_img = Image.open(external_texture_path).convert("RGB")
+        ext_tex_img = Image.open(external_texture_path).convert("RGBA")
 
     # メッシュ読み込み (process=False でテクスチャやUVの自動削除を防止)
     loaded = trimesh.load(mesh_path, process=False)
 
     # GLTF / GLB などの Scene オブジェクトの場合、各ノードのトランスフォームを適用して個別展開
-    submeshes = []
+    raw_submeshes = []
     if isinstance(loaded, trimesh.Scene):
         # dump() で各ジオメトリインスタンスのワールド変換行列を適用した Trimesh リストを取得
         dumped = loaded.dump()
         for m in dumped:
             if isinstance(m, trimesh.Trimesh) and len(m.vertices) > 0 and len(m.faces) > 0:
-                submeshes.append(m)
+                raw_submeshes.append(m)
     elif isinstance(loaded, trimesh.Trimesh):
-        submeshes.append(loaded)
+        raw_submeshes.append(loaded)
     else:
         raise ValueError(f"サポートされていない形式または空のデータです: {type(loaded)}")
 
-    if len(submeshes) == 0:
+    if len(raw_submeshes) == 0:
         raise ValueError("有効なメッシュジオメトリが見つかりませんでした。")
+
+    # 同一メッシュ内の複数マテリアル (face_materials) をサブメッシュに分割展開
+    submeshes = []
+    for m in raw_submeshes:
+        submeshes.extend(split_submeshes_by_material(m))
 
     # テクスチャのないメッシュを完全に無視・除外するフィルタリング
     if only_textured:
@@ -255,33 +332,85 @@ def sample_mesh_surface(
         if count <= 0:
             continue
 
-        # 表面サンプリング
-        pts, face_indices = trimesh.sample.sample_surface(mesh, count)
+        collected_pts = []
+        collected_norms = []
+        collected_cols = []
+        collected_count = 0
 
-        # 法線ベクトルの取得
-        if len(mesh.face_normals) > 0 and len(face_indices) > 0:
-            norms = mesh.face_normals[face_indices]
-        else:
-            norms = np.zeros_like(pts)
-            norms[:, 2] = 1.0
+        # only_textured の場合は、テクスチャ有効部分から目標点数を集めるためリトライサンプリング
+        max_attempts = 5 if only_textured else 1
+        attempt = 0
 
-        # 色の取得
-        if color_mode == "random":
-            cols = np.random.uniform(0.0, 1.0, size=(count, 3)).astype(np.float32)
-        elif color_mode == "white":
-            cols = np.ones((count, 3), dtype=np.float32)
-        else:
-            cols = sample_colors_from_submesh(
-                mesh=mesh,
-                points=pts,
-                face_indices=face_indices,
-                external_texture_img=ext_tex_img,
-                default_color=default_color
-            )
+        while collected_count < count and attempt < max_attempts:
+            attempt += 1
+            needed = count - collected_count
+            sample_n = needed if attempt == 1 else max(needed, int(needed * 1.5))
 
-        all_points.append(pts)
-        all_normals.append(norms)
-        all_colors.append(cols)
+            # 表面サンプリング
+            pts, face_indices = trimesh.sample.sample_surface(mesh, sample_n)
+            if len(pts) == 0:
+                break
+
+            # 法線ベクトルの取得
+            if len(mesh.face_normals) > 0 and len(face_indices) > 0:
+                norms = mesh.face_normals[face_indices]
+            else:
+                norms = np.zeros_like(pts)
+                norms[:, 2] = 1.0
+
+            # 色の取得とテクスチャ有無判定
+            if color_mode == "random":
+                cols = np.random.uniform(0.0, 1.0, size=(sample_n, 3)).astype(np.float32)
+                has_tex = np.ones(sample_n, dtype=bool)
+            elif color_mode == "white":
+                cols = np.ones((sample_n, 3), dtype=np.float32)
+                has_tex = np.ones(sample_n, dtype=bool)
+            else:
+                cols, has_tex = sample_colors_from_submesh(
+                    mesh=mesh,
+                    points=pts,
+                    face_indices=face_indices,
+                    external_texture_img=ext_tex_img,
+                    default_color=default_color
+                )
+
+            # only_textured の場合、テクスチャが着いていない部分（UV未展開、透過部分、フォールバック色）を完全に除外
+            if only_textured:
+                valid_mask = has_tex
+                pts = pts[valid_mask]
+                norms = norms[valid_mask]
+                cols = cols[valid_mask]
+
+                # 1回目の試行で有効点がゼロの場合、このサブメッシュには有効テクスチャ部分が存在しないため早期終了
+                if len(pts) == 0 and attempt == 1:
+                    break
+
+            if len(pts) > 0:
+                collected_pts.append(pts)
+                collected_norms.append(norms)
+                collected_cols.append(cols)
+                collected_count += len(pts)
+
+        if collected_count > 0:
+            c_pts = np.concatenate(collected_pts, axis=0)
+            c_norms = np.concatenate(collected_norms, axis=0)
+            c_cols = np.concatenate(collected_cols, axis=0)
+
+            # 目標点数 count を超えた分を切り詰め
+            if len(c_pts) > count:
+                c_pts = c_pts[:count]
+                c_norms = c_norms[:count]
+                c_cols = c_cols[:count]
+
+            all_points.append(c_pts)
+            all_normals.append(c_norms)
+            all_colors.append(c_cols)
+
+    if len(all_points) == 0:
+        raise ValueError(
+            "有効なサンプリング点が見つかりませんでした。"
+            + (" テクスチャが存在する領域が見つかりませんでした。--only_textured を外すか、テクスチャが設定されたモデルをご使用ください。" if only_textured else "")
+        )
 
     points = np.concatenate(all_points, axis=0).astype(np.float32)
     normals = np.concatenate(all_normals, axis=0).astype(np.float32)
@@ -495,7 +624,7 @@ def mesh_to_gaussian_ply(
         default_color: 色が見つからない場合のデフォルトRGB (0.0〜1.0)
         flat_disks: Trueの場合、メッシュ表面に沿ったディスク状のガウシアンを生成
         sh_degree: 球面調和関数の次数 (デフォルト: 3)
-        only_textured: Trueの場合、テクスチャのないメッシュ（サブメッシュ）を完全に無視・除外する
+        only_textured: Trueの場合、テクスチャのないメッシュや同一メッシュ内のテクスチャ未設定部分を完全に無視・除外する
     """
     print(f"=== メッシュのガウシアン化開始 ===")
     print(f"  入力メッシュ: {mesh_path}")
@@ -572,7 +701,7 @@ def main():
     )
     parser.add_argument(
         "--only_textured", action="store_true",
-        help="テクスチャを持たないメッシュ（サブメッシュ）を完全に無視・除外するフラグ"
+        help="テクスチャを持たないメッシュおよび同一メッシュ内のテクスチャ未設定部分を完全に無視・除外するフラグ"
     )
     parser.add_argument(
         "--flat_disks", action="store_true",
