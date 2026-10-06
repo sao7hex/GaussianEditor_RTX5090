@@ -64,6 +64,27 @@ def inverse_sigmoid(x: np.ndarray) -> np.ndarray:
 # 1. メッシュ読み込みおよび表面点群サンプリング (OBJ, PLY, GLTF/GLB, STL対応)
 # ==============================================================================
 
+def mesh_has_texture(mesh: trimesh.Trimesh, external_texture_img: Optional[Image.Image] = None) -> bool:
+    """
+    メッシュが画像テクスチャ（埋め込みまたは外部）およびUV座標を持っているかを判定する。
+    """
+    has_uv = hasattr(mesh.visual, "uv") and mesh.visual.uv is not None and len(mesh.visual.uv) > 0
+
+    # 1. 外部テクスチャが指定されており、UV座標がある場合
+    if external_texture_img is not None and has_uv:
+        return True
+
+    # 2. メッシュ自身のマテリアルに画像テクスチャがあり、かつUV座標がある場合
+    mat = getattr(mesh.visual, "material", None)
+    if mat is not None and has_uv:
+        if hasattr(mat, "image") and mat.image is not None:
+            return True
+        if hasattr(mat, "baseColorTexture") and mat.baseColorTexture is not None:
+            return True
+
+    return False
+
+
 def sample_colors_from_submesh(
     mesh: trimesh.Trimesh,
     points: np.ndarray,
@@ -157,11 +178,15 @@ def sample_mesh_surface(
     num_points: int = 200000,
     external_texture_path: Optional[str] = None,
     color_mode: str = "auto",
-    default_color: Tuple[float, float, float] = (0.8, 0.8, 0.8)
+    default_color: Tuple[float, float, float] = (0.8, 0.8, 0.8),
+    only_textured: bool = False
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     メッシュ (OBJ, PLY, STL, GLTF/GLB 等) から表面点群・法線・色を一様サンプリングする。
     GLTFなどの階層ノードやトランスフォーム、複数マテリアルに対応。
+
+    Args:
+        only_textured: Trueの場合、テクスチャを持たないメッシュを完全に無視・除外する。
 
     Returns:
         points: (N, 3) 頂点座標
@@ -194,6 +219,17 @@ def sample_mesh_surface(
 
     if len(submeshes) == 0:
         raise ValueError("有効なメッシュジオメトリが見つかりませんでした。")
+
+    # テクスチャのないメッシュを完全に無視・除外するフィルタリング
+    if only_textured:
+        textured_submeshes = [m for m in submeshes if mesh_has_texture(m, ext_tex_img)]
+        print(f"  [テクスチャフィルタ] 対象メッシュ: {len(textured_submeshes)} / {len(submeshes)} 個 (テクスチャのない {len(submeshes) - len(textured_submeshes)} 個を除外)")
+        if len(textured_submeshes) == 0:
+            raise ValueError(
+                "テクスチャを持つメッシュ（またはUV情報）が見つかりませんでした。"
+                "--only_textured オプションを外すか、テクスチャが設定されたモデルをご使用ください。"
+            )
+        submeshes = textured_submeshes
 
     # 各サブメッシュの表面積を計算してサンプリング点数を配分
     areas = np.array([max(m.area, 1e-9) for m in submeshes], dtype=np.float64)
@@ -444,7 +480,8 @@ def mesh_to_gaussian_ply(
     color_mode: str = "auto",
     default_color: Tuple[float, float, float] = (0.8, 0.8, 0.8),
     flat_disks: bool = False,
-    sh_degree: int = 3
+    sh_degree: int = 3,
+    only_textured: bool = False
 ):
     """
     メッシュファイルを読み込み、表面サンプリングを行って3DGSのPLYファイルを出力する。
@@ -458,11 +495,13 @@ def mesh_to_gaussian_ply(
         default_color: 色が見つからない場合のデフォルトRGB (0.0〜1.0)
         flat_disks: Trueの場合、メッシュ表面に沿ったディスク状のガウシアンを生成
         sh_degree: 球面調和関数の次数 (デフォルト: 3)
+        only_textured: Trueの場合、テクスチャのないメッシュ（サブメッシュ）を完全に無視・除外する
     """
     print(f"=== メッシュのガウシアン化開始 ===")
     print(f"  入力メッシュ: {mesh_path}")
     print(f"  サンプリング点数: {num_points:,}")
     print(f"  カラーモード: {color_mode}")
+    print(f"  テクスチャ必須モード (only_textured): {only_textured}")
     if texture_path:
         print(f"  指定テクスチャ: {texture_path}")
 
@@ -472,7 +511,8 @@ def mesh_to_gaussian_ply(
         num_points=num_points,
         external_texture_path=texture_path,
         color_mode=color_mode,
-        default_color=default_color
+        default_color=default_color,
+        only_textured=only_textured
     )
     print(f"  サンプリング完了: 点数 = {points.shape[0]:,}")
 
@@ -531,6 +571,10 @@ def main():
         help="色の決定方式: auto (テクスチャ/頂点カラー優先), random (ランダム色), white (白色)"
     )
     parser.add_argument(
+        "--only_textured", action="store_true",
+        help="テクスチャを持たないメッシュ（サブメッシュ）を完全に無視・除外するフラグ"
+    )
+    parser.add_argument(
         "--flat_disks", action="store_true",
         help="メッシュ表面に沿った薄いディスク型ガウシアンにするフラグ"
     )
@@ -561,7 +605,8 @@ def main():
         color_mode=args.color_mode,
         default_color=default_color,
         flat_disks=args.flat_disks,
-        sh_degree=args.sh_degree
+        sh_degree=args.sh_degree,
+        only_textured=args.only_textured
     )
 
 
