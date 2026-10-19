@@ -78,53 +78,86 @@ graph TD
 
 ---
 
-## 5. コマンドライン引数一覧
+## 5. 推奨ディレクトリ構造 (`Mesh2Gaussian_data`)
 
-| 引数名 | 短縮 | 必須 | デフォルト値 | 説明 |
-| :--- | :---: | :---: | :---: | :--- |
-| `--mesh` | `-m` | **必須** | - | Blender等で配置済みの3Dメッシュファイルパス（`.glb` 推奨、`.gltf`, `.obj`） |
-| `--source_path` | `-s` | **必須** | - | Colmapデータセットディレクトリ（`sparse/0/` があるパス） |
-| `--model_path` | - | 任意 | `source_path` | 学習済み3DGSモデルの出力先ディレクトリ |
-| `--iteration` | - | 任意 | `-1` (最新) | 読み込む学習済みチェックポイントのイテレーション番号 |
-| `--output_ply` | `-o` | 任意 | `merged.ply` | 既存シーンと結合した出力先PLYファイル名 |
-| `--num_points` | `-n` | 任意 | `200000` | メッシュ表面からサンプリングするガウシアン点数 |
-| `--cam_id` | - | 任意 | `0` | 単一マスクをレンダリング保存する基準Colmapカメラ番号 |
-| `--save_mask` | - | 任意 | `silhouette_mask.png` | 生成された2Dシルエットマスク（単一視点）の保存先パス |
-| `--multiview_mask_dir` | - | 任意 | `None` | 全カメラ視点から2Dマスクを一括出力する保存先フォルダパス |
-| `--depth_tolerance` | - | 任意 | `0.005` | 同一平面とみなす深度トレランス（Z-fighting解消用） |
+入出力データをすべて集約・管理するため、プロジェクト直下に `Mesh2Gaussian_data` フォルダを使用します（スクリプト初回実行時にも自動生成されます）。
 
----
-
-## 6. 使用例
-
-### 基本実行（単一視点マスクの生成 ＆ 結合PLYの保存）
-
-```bash
-python Mesh2Gaussian.py \
-    --mesh "./data/my_aligned_model.glb" \
-    --source_path "./dataset/scene_colmap" \
-    --model_path "./output/scene_model" \
-    --output_ply "./output/scene_model/point_cloud/iteration_30000/merged.ply" \
-    --save_mask "./output/masks/mask_cam0.png" \
-    --cam_id 0
-```
-
-### 全カメラ視点からのマルチビューマスク一括生成
-
-GaussianEditor のセグメンテーションや編集パイプライン（SAM等）でマルチビューマスクを利用する場合、`--multiview_mask_dir` を指定します。
-
-```bash
-python Mesh2Gaussian.py \
-    --mesh "./data/my_aligned_model.glb" \
-    --source_path "./dataset/scene_colmap" \
-    --model_path "./output/scene_model" \
-    --output_ply "./output/merged_scene.ply" \
-    --multiview_mask_dir "./dataset/scene_colmap/multiview_masks"
+```text
+GaussianEditor_RTX5090/
+├── Mesh2Gaussian.py
+├── Readme_Mesh2Gaussian.md
+│
+└── Mesh2Gaussian_data/                 # 【データ集約フォルダ】
+    ├── input/
+    │   ├── mesh/                       # ★ここにGLBメッシュを配置 (自動認識)
+    │   │   └── my_model.glb
+    │   ├── colmap/                     # ★ここにColmapデータセットを配置 (sparse/0/, images/ 等)
+    │   │   ├── sparse/0/
+    │   │   └── images/
+    │   └── model/                      # （任意）既存の学習済み3DGSモデル (point_cloud/)
+    │       └── point_cloud/
+    │           └── iteration_30000/
+    │
+    └── output/                         # ★すべての出力がここに自動集約されます
+        ├── merged_refined.ply          # 最終PLYファイル (自動生成)
+        └── masks/
+            ├── mask_cam0.png           # 基準カメラの2Dシルエットマスク (自動生成)
+            └── multiview/              # 全カメラ視点の2Dマスク群 (自動生成)
 ```
 
 ---
 
-## 7. トラブルシューティング
+## 6. 使用例（コマンドライン実行）
+
+### ① 【最短実行】引数なしで一発全自動実行（推奨）
+
+上記の `Mesh2Gaussian_data/input/mesh/` にメッシュを、`input/colmap/` にColmapデータを置いておけば、**コマンドライン引数を一切指定しなくても、すべて全自動で実行**されます。
+（不要点群の自動削除・2Dマスク出力・拡散モデル境界最適化がすべてデフォルトで有効です）
+
+```bash
+python Mesh2Gaussian.py
+```
+
+### ② 入力パスだけを指定して実行
+
+メッシュやColmapデータが別フォルダにある場合、**入力パスだけを指定**すれば、出力先やパラメータは自動的に `Mesh2Gaussian_data/output/` 配下に設定されます。
+
+```bash
+python Mesh2Gaussian.py \
+    --mesh "C:/path/to/my_aligned_mesh.glb" \
+    --source_path "C:/path/to/colmap_dataset"
+```
+
+### ③ 拡散モデルによる最適化をスキップして素早く結合したい場合
+
+```bash
+python Mesh2Gaussian.py --no_refine
+```
+
+---
+
+## 7. コマンドライン引数一覧
+
+すべての引数はデフォルト値が設定されているため、特別なカスタマイズが必要な場合のみ指定してください。
+
+| 引数名 | 短縮 | デフォルト値 | 説明 |
+| :--- | :---: | :---: | :--- |
+| `--data_dir` | - | `Mesh2Gaussian_data` | 入出力を集約する基準フォルダパス |
+| `--mesh` | `-m` | 自動検出 | 配置済み3Dメッシュファイル（未指定時は `data_dir/input/mesh/` から自動検出） |
+| `--source_path` | `-s` | `data_dir/input/colmap` | Colmapデータセットディレクトリ |
+| `--model_path` | - | `source_path` | 学習済み3DGSモデルディレクトリ |
+| `--iteration` | - | `-1` (最新) | 読み込む学習済みチェックポイント番号 |
+| `--output_ply` | `-o` | `data_dir/output/merged_refined.ply` | 最終結合PLYファイルの保存先 |
+| `--save_mask` | - | `data_dir/output/masks/mask_cam0.png` | 基準カメラの2Dマスク保存先 |
+| `--multiview_mask_dir` | - | `data_dir/output/masks/multiview` | 全カメラ2Dマスク一括保存先フォルダ |
+| `--no_prune` | - | `False` (自動削除有効) | 重複する不要ガウシアンの自動くり抜きを無効化するフラグ |
+| `--no_refine` | - | `False` (最適化有効) | 拡散モデルによる境界ブレンディングを無効化するフラグ |
+| `--prompt` | - | `a photorealistic...` | 境界ブレンディング最適化のプロンプト |
+| `--refine_steps` | - | `200` | 最適化ステップ数 |
+
+---
+
+## 8. トラブルシューティング
 
 - **デカール等の重なり部分がチラつく／消える場合**:
   - 重ねるメッシュのオブジェクト名末尾にインデックス（`_01`, `_02` など）を付与し、上に来るメッシュの番号を大きくしてください。
@@ -132,3 +165,5 @@ python Mesh2Gaussian.py \
 - **テクスチャが真っ暗またはサンプリングされない場合**:
   - メッシュにUV展開が行われているか確認してください（UVが存在しない面はデフォルトカラーが適用されます）。
   - GLBエクスポート時に「マテリアル」および「テクスチャ画像」が埋め込まれていることを確認してください。
+
+
