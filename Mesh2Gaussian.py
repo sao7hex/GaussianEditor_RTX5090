@@ -2,12 +2,13 @@
 Mesh2Gaussian.py
 
 【前提条件】
-入力となる3Dメッシュファイル（.obj, .ply, .glb等）は、
+入力となる3Dメッシュファイル（.glb 推奨、.gltf, .obj等にも対応）は、
 Blenderなどの3Dソフトウェア上で既存シーンの点群に合わせて
 「位置・向き・スケールが配置・調整済み」であることを前提とします。
 
 【処理概要】
-1. Wonder3D等の推論・メッシュ生成処理をバイパスし、既存メッシュの頂点座標をそのまま保持してガウシアン化。
+1. GLBファイルに内包されている「本来のテクスチャ画像 (baseColorTexture)」と「UV座標」から
+   正確なカラー（RGB）をサンプリングし、頂点座標を維持したままガウシアン化。
 2. 配置済みの3DメッシュをColmapのカメラ座標からレンダリングし、物体の輪郭に完全一致した「高精度2Dシルエットマスク」を自動生成・保存。
 3. 座標変換（回転・移動・スケーリング）を一切挟まず、GaussianModel.concat_gaussians で既存シーンに直接結合してPLY保存。
 """
@@ -21,6 +22,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import trimesh
 from PIL import Image
 
 # ==============================================================================
@@ -33,13 +35,135 @@ from gaussiansplatting.arguments import ModelParams, PipelineParams
 from gaussiansplatting.gaussian_renderer import render
 from gaussiansplatting.utils.graphics_utils import BasicPointCloud
 
-# threestudio ユーティリティ
-from threestudio.utils.mesh import load_mesh_as_pcd_trimesh
-
 
 # ==============================================================================
-# 1. メッシュからのガウシアンモデル生成 (ワールド座標系をそのまま維持)
+# 1. GLBテクスチャサンプリング & ガウシアン化 (テクスチャ色をそのまま反映)
 # ==============================================================================
+def sample_colors_from_submesh(
+    mesh: trimesh.Trimesh,
+    points: np.ndarray,
+    face_indices: np.ndarray,
+    default_color: Tuple[float, float, float] = (0.8, 0.8, 0.8),
+) -> np.ndarray:
+    """
+    GLB/GLTFのPBRマテリアル (baseColorTexture, baseColorFactor) や UV座標から
+    サンプリング点の色 (RGB [0, 1]) を正確に補間・取得する。
+    """
+    n_pts = points.shape[0]
+    if n_pts == 0:
+        return np.empty((0, 3), dtype=np.float32)
+
+    # 1. テクスチャ画像およびベースカラー係数の抽出
+    tex_img = None
+    base_factor = None
+    mat = getattr(mesh.visual, "material", None)
+
+    if mat is not None:
+        # GLB/GLTF PBRマテリアルの baseColorTexture
+        if hasattr(mat, "baseColorTexture") and mat.baseColorTexture is not None:
+            tex_img = mat.baseColorTexture.convert("RGB")
+        # 一般的なテクスチャ画像
+        elif hasattr(mat, "image") and mat.image is not None:
+            tex_img = mat.image.convert("RGB")
+
+        # baseColorFactor (乗算カラー係数)
+        if hasattr(mat, "baseColorFactor") and mat.baseColorFactor is not None:
+            base_factor = np.asarray(mat.baseColorFactor, dtype=np.float32)[:3]
+        elif hasattr(mat, "diffuse") and mat.diffuse is not None:
+            bf = np.asarray(mat.diffuse, dtype=np.float32)[:3]
+            base_factor = bf / 255.0 if np.max(bf) > 1.0 else bf
+
+    # 2. テクスチャ画像 + UV座標が存在する場合: 重心座標で補間サンプリング
+    if tex_img is not None and hasattr(mesh.visual, "uv") and mesh.visual.uv is not None and len(mesh.visual.uv) > 0:
+        try:
+            tex_np = np.asarray(tex_img, dtype=np.float32) / 255.0
+            tex_h, tex_w = tex_np.shape[:2]
+
+            faces = mesh.faces[face_indices]
+            tri_verts = mesh.vertices[faces]
+            barycentric = trimesh.triangles.points_to_barycentric(tri_verts, points)
+
+            # 面ごとのUVを重心座標で補間
+            uvs = mesh.visual.uv[faces]
+            sampled_uvs = np.sum(uvs * barycentric[:, :, None], axis=1)
+
+            # UV座標からピクセルインデックスを算出 (リピート・反転対応)
+            u = np.clip(sampled_uvs[:, 0] % 1.0, 0.0, 1.0) * (tex_w - 1)
+            v = np.clip((1.0 - (sampled_uvs[:, 1] % 1.0)), 0.0, 1.0) * (tex_h - 1)
+            u_idx = np.clip(np.round(u).astype(int), 0, tex_w - 1)
+            v_idx = np.clip(np.round(v).astype(int), 0, tex_h - 1)
+            colors = tex_np[v_idx, u_idx, :3]
+
+            if base_factor is not None:
+                colors = colors * base_factor
+
+            return colors.astype(np.float32)
+        except Exception as e:
+            print(f"  [Warning] テクスチャサンプリング失敗: {e}. 代替カラーを使用します。")
+
+    # 3. 頂点カラーが存在する場合のフォールバック
+    if hasattr(mesh.visual, "vertex_colors") and mesh.visual.vertex_colors is not None and len(mesh.visual.vertex_colors) > 0:
+        v_colors = mesh.visual.vertex_colors[:, :3].astype(np.float32)
+        if np.max(v_colors) > 1.0:
+            v_colors = v_colors / 255.0
+        faces = mesh.faces[face_indices]
+        tri_verts = mesh.vertices[faces]
+        barycentric = trimesh.triangles.points_to_barycentric(tri_verts, points)
+        colors = np.sum(v_colors[faces] * barycentric[:, :, None], axis=1)
+        return colors.astype(np.float32)
+
+    # 4. マテリアル単色またはデフォルト色
+    if base_factor is not None:
+        return np.full((n_pts, 3), base_factor, dtype=np.float32)
+    return np.full((n_pts, 3), default_color, dtype=np.float32)
+
+
+def sample_mesh_with_texture(mesh_path: str, num_points: int = 200000) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    GLBメッシュを読み込み、テクスチャをそのまま反映した表面点群 (points, colors) を抽出する。
+    """
+    loaded = trimesh.load(mesh_path, process=False)
+
+    submeshes = []
+    if isinstance(loaded, trimesh.Scene):
+        # GLBの各階層ノードのトランスフォーム行列を適用してフラット化
+        dumped = loaded.dump()
+        for m in dumped:
+            if isinstance(m, trimesh.Trimesh) and len(m.vertices) > 0 and len(m.faces) > 0:
+                submeshes.append(m)
+    elif isinstance(loaded, trimesh.Trimesh):
+        submeshes.append(loaded)
+    else:
+        raise ValueError(f"対応していないメッシュ形式です: {type(loaded)}")
+
+    if len(submeshes) == 0:
+        raise ValueError("有効なメッシュジオメトリが見つかりませんでした。")
+
+    # 表面積に応じてサンプリング点数を按分
+    areas = np.array([max(m.area, 1e-9) for m in submeshes], dtype=np.float64)
+    weights = areas / np.sum(areas)
+    sub_counts = np.round(weights * num_points).astype(int)
+
+    diff = num_points - np.sum(sub_counts)
+    if diff != 0:
+        sub_counts[np.argmax(areas)] += diff
+
+    all_points = []
+    all_colors = []
+
+    for mesh, count in zip(submeshes, sub_counts):
+        if count <= 0:
+            continue
+        pts, face_indices = trimesh.sample.sample_surface(mesh, count)
+        cols = sample_colors_from_submesh(mesh, pts, face_indices)
+        all_points.append(pts)
+        all_colors.append(cols)
+
+    points = np.concatenate(all_points, axis=0).astype(np.float32)
+    colors = np.concatenate(all_colors, axis=0).astype(np.float32)
+    return points, colors
+
+
 def convert_mesh_to_gaussian(
     mesh_path: str,
     output_gs_path: str,
@@ -49,9 +173,9 @@ def convert_mesh_to_gaussian(
     use_refine: bool = False,
 ) -> VanillaGaussianModel:
     """
-    配置済み3Dメッシュのワールド座標・スケールを完全に維持したままガウシアン化する。
+    GLBメッシュ本来のテクスチャ画像とワールド座標を完全に維持したままガウシアン化する。
     """
-    print(f"\n[Step 1] メッシュのガウシアン化を開始: {mesh_path}")
+    print(f"\n[Step 1] GLBメッシュのガウシアン化を開始: {mesh_path}")
     os.makedirs(os.path.dirname(os.path.abspath(output_gs_path)), exist_ok=True)
 
     if use_refine and refine_prompt:
@@ -74,20 +198,20 @@ def convert_mesh_to_gaussian(
         obj_gaussian.load_ply(output_gs_path)
         return obj_gaussian
     else:
-        print(f"  -> threestudio.utils.mesh.load_mesh_as_pcd_trimesh により表面点群をサンプリング (目標点数: {num_points:,})")
-        xyz, colors = load_mesh_as_pcd_trimesh(mesh_path, num_points)
+        print(f"  -> 内包テクスチャ画像 (baseColorTexture) から色を直接サンプリング (目標点数: {num_points:,})")
+        points, colors = sample_mesh_with_texture(mesh_path, num_points)
         
-        # 点群の作成（座標変換は一切加えず、メッシュ本来の3Dワールド座標を使用）
-        pcd = BasicPointCloud(points=xyz.cpu().numpy(), colors=colors.cpu().numpy(), normals=None)
+        # 点群の作成（メッシュ本来の3Dワールド座標とテクスチャRGBカラーを使用）
+        pcd = BasicPointCloud(points=points, colors=colors, normals=None)
         
         obj_gaussian = VanillaGaussianModel(sh_degree=3)
         obj_gaussian.create_from_pcd(pcd, spatial_lr_scale=camera_extent)
         
-        # 不透明度を明示的に高めに設定
+        # 不透明度をしっかり可視化される値に設定
         obj_gaussian._opacity.data = torch.ones_like(obj_gaussian._opacity.data) * 4.595  # sigmoid(4.595) ~ 0.99
         
         obj_gaussian.save_ply(output_gs_path)
-        print(f"  -> ガウシアン化完了: {output_gs_path} (点数: {obj_gaussian.get_xyz.shape[0]:,})")
+        print(f"  -> テクスチャ付きガウシアン化完了: {output_gs_path} (点数: {obj_gaussian.get_xyz.shape[0]:,})")
         return obj_gaussian
 
 
@@ -166,7 +290,6 @@ def generate_multiview_masks(
     saved_count = 0
     for idx, cam in enumerate(cameras):
         mask_tensor, mask_image = render_mesh_silhouette_mask(obj_gaussian, cam, pipe)
-        # 物体が写っている（Trueのピクセルが1つ以上ある）カメラ視点のみ保存
         if mask_tensor.sum() > 0:
             mask_filename = os.path.join(output_dir, f"mask_cam_{idx:04d}.png")
             mask_image.save(mask_filename)
@@ -205,17 +328,17 @@ def merge_and_save_scene(
 # ==============================================================================
 def main():
     parser = argparse.ArgumentParser(
-        description="【配置済みメッシュ用】3Dメッシュをガウシアン化し、Colmapカメラからの2Dマスク生成と3DGSシーンへの直接統合を行うプログラム"
+        description="【配置済みGLBメッシュ用】GLBのテクスチャをそのまま反映してガウシアン化し、Colmapカメラからの2Dマスク生成とシーン統合を行うプログラム"
     )
-    # 必須・基本入力
-    parser.add_argument("--mesh", "-m", type=str, required=True, help="Blender等で配置済みの3Dメッシュ (.obj, .ply, .glb等)")
+    # 必須・基本入力 (GLB推奨)
+    parser.add_argument("--mesh", "-m", type=str, required=True, help="Blender等で配置済みの3Dメッシュファイル (.glb 推奨, .gltf, .obj等)")
     parser.add_argument("--source_path", "-s", type=str, required=True, help="Colmapデータセットのパス (sparse/0/ があるディレクトリ)")
     parser.add_argument("--model_path", type=str, default=None, help="学習済み3DGSモデルのパス (指定しない場合は source_path)")
     parser.add_argument("--iteration", type=int, default=-1, help="読み込む学習イテレーション番号 (デフォルト: 最新)")
     parser.add_argument("--output_ply", "-o", type=str, default="merged.ply", help="結合後の出力PLYファイルパス")
 
     # メッシュ変換設定
-    parser.add_argument("--num_points", "-n", type=int, default=200000, help="メッシュからサンプリングするガウシアン点数")
+    parser.add_argument("--num_points", "-n", type=int, default=200000, help="メッシュからサンプリングするガウシアン点数 (デフォルト: 200,000)")
     parser.add_argument("--refine_prompt", "-p", type=str, default=None, help="train_from_mesh によるリファイン用プロンプト (任意)")
     parser.add_argument("--use_refine", action="store_true", help="train_from_mesh.py による InstructPix2Pix リファインを実行する")
 
@@ -227,7 +350,7 @@ def main():
     args = parser.parse_args()
     pipe = PipelineParams(parser=argparse.ArgumentParser(), sent_args=[])
 
-    # 1. メッシュのガウシアン化 (位置・姿勢・サイズはそのまま保持)
+    # 1. GLBメッシュのガウシアン化 (テクスチャ色・ワールド座標を完全保持)
     temp_gs_path = "temp_mesh_gs.ply"
     obj_gaussian = convert_mesh_to_gaussian(
         mesh_path=args.mesh,
