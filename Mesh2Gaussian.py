@@ -997,6 +997,13 @@ def main():
     # 5. シーンの結合
     # --------------------------------------------------------------------------
     print(f"\n[Step 5] メッシュガウシアンをベースシーンに結合します...")
+    if base_gaussian.optimizer is None:
+        from gaussiansplatting.arguments import OptimizationParams
+        opt = OptimizationParams(argparse.ArgumentParser(), max_steps=args.refine_steps if refine_enabled else 1000)
+        if hasattr(scene, "cameras_extent"):
+            base_gaussian.spatial_lr_scale = scene.cameras_extent
+        base_gaussian.training_setup(opt)
+
     base_gaussian.concat_gaussians(full_gaussian)
 
     # --------------------------------------------------------------------------
