@@ -826,6 +826,7 @@ def main():
     parser.add_argument("--output_ply", "-o", type=str, default=None, help="出力先PLYファイル名 (未指定時: data_dir/output/merged_refined.ply)")
     parser.add_argument("--save_mask", type=str, default=None, help="基準カメラの2Dマスク保存先 (未指定時: data_dir/output/masks/mask_cam0.png)")
     parser.add_argument("--multiview_mask_dir", type=str, default=None, help="全カメラ2Dマスク保存先フォルダ (未指定時: data_dir/output/masks/multiview/)")
+    parser.add_argument("--no_multiview", action="store_true", default=False, help="全カメラ視点2Dマスクの一括生成を無効化する")
 
     # メッシュ変換＆レンダリング設定
     parser.add_argument("--num_points", "-n", type=int, default=200000, help="サンプリングするガウシアン点数 (デフォルト: 200,000)")
@@ -905,6 +906,7 @@ def main():
     default_ply_name = "merged_refined.ply" if refine_enabled else "merged.ply"
     output_ply = args.output_ply if args.output_ply else os.path.join(output_dir, default_ply_name)
     save_mask = args.save_mask if args.save_mask else os.path.join(output_masks_dir, "mask_cam0.png")
+    multiview_enabled = not args.no_multiview
     multiview_mask_dir = args.multiview_mask_dir if args.multiview_mask_dir else os.path.join(output_masks_dir, "multiview")
 
     print("=" * 70)
@@ -914,7 +916,8 @@ def main():
     print(f"  ・Colmapデータセット : {source_path}")
     print(f"  ・3DGSモデル入力     : {model_path}")
     print(f"  ・出力PLYファイル    : {output_ply}")
-    print(f"  ・2Dマスク保存先     : {save_mask}")
+    print(f"  ・単一2Dマスク保存先 : {save_mask}")
+    print(f"  ・全カメラマスク保存 : {'有効 (フォルダ: ' + multiview_mask_dir + ')' if multiview_enabled else '無効'}")
     print(f"  ・不要点群自動削除   : {'有効' if auto_prune_enabled else '無効'}")
     print(f"  ・拡散モデルRefine   : {'有効 (Steps: ' + str(args.refine_steps) + ')' if refine_enabled else '無効'}")
     print("=" * 70)
@@ -944,7 +947,7 @@ def main():
     cam = train_cams[min(args.cam_id, len(train_cams) - 1)]
 
     # --------------------------------------------------------------------------
-    # 3. インテリジェント遮蔽 ＆ 内部Zバッファ合成による2Dマスク生成
+    # 3. インテリジェント遮蔽 ＆ 内部Zバッファ合成による2Dマスク生成 (全視点デフォルト有効)
     # --------------------------------------------------------------------------
     if save_mask:
         _, mask_img = render_mesh_silhouette_mask_with_zbuffer(
@@ -955,9 +958,9 @@ def main():
         )
         os.makedirs(os.path.dirname(os.path.abspath(save_mask)), exist_ok=True)
         mask_img.save(save_mask)
-        print(f"\n[Mask] カメラ {args.cam_id} から見た高精度2Dマスクを保存しました: {save_mask}")
+        print(f"\n[Mask] 基準カメラ {args.cam_id} の2Dマスクを保存しました: {save_mask}")
 
-    if multiview_mask_dir:
+    if multiview_enabled and multiview_mask_dir:
         generate_multiview_masks(
             render_layers_by_idx=render_layers_by_idx,
             cameras=train_cams,

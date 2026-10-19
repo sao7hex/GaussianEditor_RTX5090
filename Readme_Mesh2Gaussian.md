@@ -149,7 +149,8 @@ python Mesh2Gaussian.py --no_refine
 | `--iteration` | - | `-1` (最新) | 読み込む学習済みチェックポイント番号 |
 | `--output_ply` | `-o` | `data_dir/output/merged_refined.ply` | 最終結合PLYファイルの保存先 |
 | `--save_mask` | - | `data_dir/output/masks/mask_cam0.png` | 基準カメラの2Dマスク保存先 |
-| `--multiview_mask_dir` | - | `data_dir/output/masks/multiview` | 全カメラ2Dマスク一括保存先フォルダ |
+| `--multiview_mask_dir` | - | `data_dir/output/masks/multiview` | 全カメラ2Dマスク一括保存先フォルダ（デフォルト有効） |
+| `--no_multiview` | - | `False` (全視点マスク生成有効) | 全カメラ視点の2Dマスク一括生成を無効化するフラグ |
 | `--no_prune` | - | `False` (自動削除有効) | 重複する不要ガウシアンの自動くり抜きを無効化するフラグ |
 | `--no_refine` | - | `False` (最適化有効) | 拡散モデルによる境界ブレンディングを無効化するフラグ |
 | `--prompt` | - | `a photorealistic...` | 境界ブレンディング最適化のプロンプト |
