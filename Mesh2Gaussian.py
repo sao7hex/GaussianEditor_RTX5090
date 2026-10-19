@@ -418,12 +418,17 @@ def load_base_scene(
     else:
         model_params_path = source_path
 
-    model_params = ModelParams(argparse.ArgumentParser())
-    model_params.source_path = source_path
-    model_params.model_path = model_params_path
+    dummy_parser = argparse.ArgumentParser()
+    lp = ModelParams(dummy_parser)
+    model_params = lp.extract(dummy_parser.parse_args([]))
+    model_params.source_path = os.path.abspath(source_path)
+    model_params.model_path = os.path.abspath(model_params_path)
     model_params.sh_degree = sh_degree
     model_params.white_background = False
     model_params.eval = False
+    model_params.images = "images"
+    model_params.resolution = -1
+    model_params.data_device = "cuda"
 
     base_gaussian = GaussianModel(
         sh_degree=sh_degree,
