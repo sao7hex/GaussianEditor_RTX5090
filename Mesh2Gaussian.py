@@ -361,30 +361,94 @@ def convert_mesh_to_gaussian(
 # ==============================================================================
 # 2. 既存シーンとColmapカメラのロード
 # ==============================================================================
+def resolve_model_path(model_dir: str) -> Optional[str]:
+    """
+    model_dir 配下の構造を柔軟に探索し、3DGSモデルのパスまたはPLYファイルを返す:
+    1. model_dir/point_cloud がある場合 -> model_dir
+    2. model_dir 直下またはサブフォルダ内に point_cloud/ がある場合 -> その親
+    3. model_dir 内に .ply ファイルがある場合 -> その .ply ファイルパス
+    """
+    if not os.path.exists(model_dir):
+        return None
+
+    # 1. model_dir/point_cloud が直接存在する場合
+    if os.path.exists(os.path.join(model_dir, "point_cloud")):
+        return model_dir
+
+    # 2. サブディレクトリ内に point_cloud があるか探索
+    for item in os.listdir(model_dir):
+        sub = os.path.join(model_dir, item)
+        if os.path.isdir(sub):
+            if os.path.exists(os.path.join(sub, "point_cloud")):
+                return sub
+
+    # 3. 直下または配下に .ply ファイルが存在するか探索
+    ply_files = []
+    for root, _, files in os.walk(model_dir):
+        for f in sorted(files):
+            if f.lower().endswith(".ply") and "temp" not in f.lower():
+                ply_files.append(os.path.join(root, f))
+    if ply_files:
+        # point_cloud.ply を優先
+        for pf in ply_files:
+            if "point_cloud.ply" in pf.lower():
+                return pf
+        return ply_files[-1]
+
+    return None
+
+
 def load_base_scene(
     source_path: str,
     model_path: Optional[str] = None,
     iteration: int = -1,
     sh_degree: int = 3,
 ) -> Tuple[GaussianModel, Scene]:
-    print(f"\n[Step 2] 既存の3DGSシーンおよびカメラデータの読み込み: {source_path}")
-    if model_path is None:
-        model_path = source_path
+    print(f"\n[Step 2] 既存の3DGSシーンおよびカメラデータの読み込み:")
+    print(f"  ・Colmapソースパス : {source_path}")
+    print(f"  ・モデルパス       : {model_path}")
 
-    model_params = ModelParams(parser=argparse.ArgumentParser(), sent_args=[])
+    direct_ply_file = None
+    if model_path is not None:
+        if os.path.isfile(model_path) and model_path.lower().endswith(".ply"):
+            direct_ply_file = model_path
+            model_params_path = os.path.dirname(os.path.abspath(model_path))
+        else:
+            model_params_path = model_path
+    else:
+        model_params_path = source_path
+
+    model_params = ModelParams(argparse.ArgumentParser())
     model_params.source_path = source_path
-    model_params.model_path = model_path
+    model_params.model_path = model_params_path
     model_params.sh_degree = sh_degree
     model_params.white_background = False
     model_params.eval = False
 
     base_gaussian = GaussianModel(sh_degree=sh_degree)
+    # direct_ply_file がある場合は Scene による自動PLY探索を抑制
+    scene_load_iter = None if direct_ply_file else iteration
+
     scene = Scene(
         args=model_params,
         gaussians=base_gaussian,
-        load_iteration=iteration,
+        load_iteration=scene_load_iter,
         shuffle=False
     )
+
+    # 直接PLYが指定されている場合は上書きロード
+    if direct_ply_file and os.path.exists(direct_ply_file):
+        print(f"  -> 指定されたPLYファイルを直接ロードします: {direct_ply_file}")
+        base_gaussian.load_ply(direct_ply_file)
+    elif scene.loaded_iter is None:
+        # Scene がイテレーション番号を見つけられなかった場合、model_params_path 配下のPLYを救済探索
+        resolved_ply = resolve_model_path(model_params_path)
+        if resolved_ply and os.path.isfile(resolved_ply):
+            print(f"  -> 学習済みPLYファイルを救済ロードします: {resolved_ply}")
+            base_gaussian.load_ply(resolved_ply)
+        else:
+            print(f"  [Notice] 学習済みモデル (point_cloud/) が見つからなかったため、Colmapの初期疎点群を使用します。")
+
     print(f"  -> シーン読み込み成功 (既存点数: {base_gaussian.get_xyz.shape[0]:,}, カメラ数: {len(scene.getTrainCameras())})")
     return base_gaussian, scene
 
@@ -823,11 +887,16 @@ def main():
 
     # 3) モデルパスの解決
     model_path = args.model_path
-    if model_path is None:
-        if os.path.exists(os.path.join(input_model_dir, "point_cloud")):
-            model_path = input_model_dir
-        else:
+    if model_path is None or not os.path.exists(model_path):
+        resolved = resolve_model_path(input_model_dir)
+        if resolved:
+            model_path = resolved
+            print(f"[*] 学習済み3DGSモデルを自動検出しました: {model_path}")
+        elif os.path.exists(os.path.join(source_path, "point_cloud")):
             model_path = source_path
+        else:
+            model_path = input_model_dir
+            print(f"[*] 学習済みモデルパスを設定: {model_path}")
 
     # 4) 出力パスの解決 (すべて Mesh2Gaussian_data/output/ 配下に統一)
     auto_prune_enabled = not args.no_prune
@@ -850,7 +919,7 @@ def main():
     print(f"  ・拡散モデルRefine   : {'有効 (Steps: ' + str(args.refine_steps) + ')' if refine_enabled else '無効'}")
     print("=" * 70)
 
-    pipe = PipelineParams(parser=argparse.ArgumentParser(), sent_args=[])
+    pipe = PipelineParams(argparse.ArgumentParser())
 
     # --------------------------------------------------------------------------
     # 1. GLBメッシュのガウシアン化 & レイヤー分類 & バウンディングボックス取得
