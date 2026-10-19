@@ -204,3 +204,6 @@ exp/
 tmp_add/
 dataset/
 ui_result/
+
+# inport export data
+Mesh2Gaussian_data/
