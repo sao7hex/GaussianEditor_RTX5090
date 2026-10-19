@@ -425,7 +425,12 @@ def load_base_scene(
     model_params.white_background = False
     model_params.eval = False
 
-    base_gaussian = GaussianModel(sh_degree=sh_degree)
+    base_gaussian = GaussianModel(
+        sh_degree=sh_degree,
+        anchor_weight_init_g0=1.0,
+        anchor_weight_init=0.1,
+        anchor_weight_multiplier=2.0,
+    )
     # direct_ply_file がある場合は Scene による自動PLY探索を抑制
     scene_load_iter = None if direct_ply_file else iteration
 
