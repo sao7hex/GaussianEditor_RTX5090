@@ -9,11 +9,15 @@ Blenderなどの3Dソフトウェア上で既存シーンの点群に合わせ�
 【処理概要】
 1. GLBファイルに内包されている「本来のテクスチャ画像 (baseColorTexture)」と「UV座標」から
    正確なカラー（RGB）をサンプリングし、頂点座標を維持したままガウシアン化。
-2. 【内部Zバッファ合成方式によるZ-fighting解消 & オクルージョン処理】
+2. 【オクルーダー遮蔽のインテリジェント制御】
+   ・「テクスチャが存在しないメッシュモデル（遮蔽物パーツ）」:
+       オクルーダーとして機能し、手前にある場合は奥のテクスチャをマスクから遮蔽・除外。
+   ・「テクスチャが存在するメッシュモデル内のテクスチャがない領域（デカールの余白・透明部分など）」:
+       オクルーダー遮断は一切行わず、完全透過（スルー）して奥のレイヤーを描画。
+3. 【内部Zバッファ合成方式によるZ-fighting解消】
    3D座標は1ミリも動かさず、PyTorch上で内部的なZバッファ（深度バッファテスト）を管理。
    同一平面上の重なりポリゴンでは「最大インデックス番号のメッシュ」を優先して手前として判定。
-   テクスチャなしメッシュが手前にある場合は、奥のテクスチャを黒で上書きして2Dマスクから完全遮蔽・除外。
-3. 座標変換（回転・移動・スケーリング）を一切挟まず、GaussianModel.concat_gaussians で既存シーンに直接結合してPLY保存。
+4. 座標変換（回転・移動・スケーリング）を一切挟まず、GaussianModel.concat_gaussians で既存シーンに直接結合してPLY保存。
 """
 
 import os
@@ -100,7 +104,7 @@ def split_submeshes_by_material(mesh: trimesh.Trimesh, base_idx: int) -> List[Tu
 
 def mesh_has_texture(mesh: trimesh.Trimesh) -> bool:
     """
-    サブメッシュが有効なUV座標および画像テクスチャを持っているかを厳密に判定する。
+    サブメッシュが有効なUV座標および画像テクスチャを持っているかを判定する。
     """
     has_uv = hasattr(mesh.visual, "uv") and mesh.visual.uv is not None and len(mesh.visual.uv) > 0
     if not has_uv:
@@ -134,7 +138,8 @@ def sample_colors_from_submesh(
     default_color: Tuple[float, float, float] = (0.8, 0.8, 0.8),
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    サブメッシュから色 (RGB [0, 1]) を取得し、同時にテクスチャから正常に取得できたかのマスク (has_tex_mask) を返す。
+    サブメッシュから色 (RGB [0, 1]) を取得し、同時に点単位でテクスチャが存在するかのマスク (has_tex_mask) を返す。
+    UV未展開面や透明部分は has_tex_mask = False となる。
     """
     n_pts = points.shape[0]
     if n_pts == 0:
@@ -209,10 +214,10 @@ def sample_colors_from_submesh(
 def sample_mesh_with_texture_and_priority(
     mesh_path: str,
     num_points: int = 200000
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    GLBメッシュを読み込み、各サブメッシュのインデックス番号を抽出。
-    表面点群 (points)、色 (colors)、テクスチャ有無 (has_tex)、優先度インデックス (priorities) を返す。
+    GLBメッシュを読み込み、各サブメッシュのインデックス番号とテクスチャ属性を抽出。
+    points, colors, pt_has_tex, priorities, mesh_has_tex_flag を返す。
     """
     loaded = trimesh.load(mesh_path, process=False)
 
@@ -249,39 +254,43 @@ def sample_mesh_with_texture_and_priority(
 
     all_points = []
     all_colors = []
-    all_has_tex = []
+    all_pt_has_tex = []
     all_priorities = []
+    all_mesh_has_tex = []
 
     tex_submesh_cnt = 0
-    print(f"  -> メッシュモデルのインデックス解析:")
+    print(f"  -> メッシュモデルのインデックス・テクスチャ解析:")
     for (mesh, p_idx, name), count in zip(final_submeshes, sub_counts):
         if count <= 0:
             continue
         
-        has_tex = mesh_has_texture(mesh)
-        if has_tex:
+        is_textured_mesh = mesh_has_texture(mesh)
+        if is_textured_mesh:
             tex_submesh_cnt += 1
 
         pts, face_indices = trimesh.sample.sample_surface(mesh, count)
         cols, pt_tex_mask = sample_colors_from_submesh(mesh, pts, face_indices)
         
-        final_pt_mask = pt_tex_mask if has_tex else np.zeros(len(pts), dtype=bool)
+        final_pt_mask = pt_tex_mask if is_textured_mesh else np.zeros(len(pts), dtype=bool)
 
         all_points.append(pts)
         all_colors.append(cols)
-        all_has_tex.append(final_pt_mask)
+        all_pt_has_tex.append(final_pt_mask)
         all_priorities.append(np.full(len(pts), p_idx, dtype=np.int32))
+        all_mesh_has_tex.append(np.full(len(pts), is_textured_mesh, dtype=bool))
 
     points = np.concatenate(all_points, axis=0).astype(np.float32)
     colors = np.concatenate(all_colors, axis=0).astype(np.float32)
-    has_tex_array = np.concatenate(all_has_tex, axis=0).astype(bool)
+    pt_has_tex = np.concatenate(all_pt_has_tex, axis=0).astype(bool)
     priorities = np.concatenate(all_priorities, axis=0).astype(np.int32)
+    mesh_has_tex_flags = np.concatenate(all_mesh_has_tex, axis=0).astype(bool)
 
     unique_priorities = np.unique(priorities)
+    tex_points_cnt = np.sum(pt_has_tex)
     print(f"  -> 検出されたメッシュインデックス一覧: {unique_priorities.tolist()} (最大値: {int(np.max(unique_priorities))} が最前面)")
-    print(f"  -> サブメッシュ構成: 全 {len(final_submeshes)} 個中、テクスチャあり {tex_submesh_cnt} 個 / なし {len(final_submeshes) - tex_submesh_cnt} 個")
+    print(f"  -> 点単位サンプリング内訳: 全 {len(points):,} 点中、テクスチャ保持 {tex_points_cnt:,} 点 ({(tex_points_cnt/len(points))*100:.1f}%), なし {len(points)-tex_points_cnt:,} 点")
 
-    return points, colors, has_tex_array, priorities
+    return points, colors, pt_has_tex, priorities, mesh_has_tex_flags
 
 
 def convert_mesh_to_gaussian(
@@ -289,16 +298,19 @@ def convert_mesh_to_gaussian(
     output_gs_path: str,
     num_points: int = 200000,
     camera_extent: float = 1.0,
-) -> Tuple[VanillaGaussianModel, Dict[int, Tuple[VanillaGaussianModel, bool]]]:
+) -> Tuple[VanillaGaussianModel, Dict[int, List[Tuple[VanillaGaussianModel, bool]]]]:
     """
     GLBメッシュをガウシアン化し、以下を返す:
     1. full_gaussian: シーン結合用の全体モデル (ワールド座標をそのまま完全保持)
-    2. sub_gaussians_by_idx: 内部Zバッファテスト用の {インデックス番号: (サブガウシアン, テクスチャ有無)} 辞書
+    2. render_layers_by_idx: 内部Zバッファ用の {インデックス番号: [(サブガウシアン, is_occluder)]} 辞書
+       ・is_occluder=False: テクスチャあり領域（白で描画）
+       ・is_occluder=True: テクスチャなしメッシュモデル全体（オクルーダーとして黒で遮蔽）
+       ※テクスチャありメッシュ内の余白（テクスチャなし領域）は、is_occluderにせず完全透過（登録しない）
     """
     print(f"\n[Step 1] GLBメッシュのガウシアン化を開始: {mesh_path}")
     os.makedirs(os.path.dirname(os.path.abspath(output_gs_path)), exist_ok=True)
 
-    points, colors, has_tex_array, priorities = sample_mesh_with_texture_and_priority(mesh_path, num_points)
+    points, colors, pt_has_tex, priorities, mesh_has_tex_flags = sample_mesh_with_texture_and_priority(mesh_path, num_points)
 
     # 全体モデルの初期化 (座標は一切変換しない)
     pcd_full = BasicPointCloud(points=points, colors=colors, normals=None)
@@ -307,25 +319,41 @@ def convert_mesh_to_gaussian(
     full_gaussian._opacity.data = torch.ones_like(full_gaussian._opacity.data) * 4.595  # ~0.99
     full_gaussian.save_ply(output_gs_path)
 
-    # 内部Zバッファテスト用: インデックスごとにサブガウシアンモデルをグループ化
-    sub_gaussians_by_idx = {}
+    # 内部Zバッファテスト用レイヤーの構築
+    render_layers_by_idx: Dict[int, List[Tuple[VanillaGaussianModel, bool]]] = {}
     unique_indices = np.unique(priorities)
     
     for idx in unique_indices:
         idx_mask = (priorities == idx)
-        pts_sub = points[idx_mask]
-        cols_sub = colors[idx_mask]
-        # このインデックスのメッシュがテクスチャを持つか
-        idx_has_tex = bool(np.any(has_tex_array[idx_mask]))
+        render_layers_by_idx[idx] = []
 
-        pcd_sub = BasicPointCloud(points=pts_sub, colors=cols_sub, normals=None)
-        sub_gs = VanillaGaussianModel(sh_degree=0)
-        sub_gs.create_from_pcd(pcd_sub, spatial_lr_scale=camera_extent)
-        sub_gs._opacity.data = torch.ones_like(sub_gs._opacity.data) * 4.595
-        sub_gaussians_by_idx[idx] = (sub_gs, idx_has_tex)
+        # 1. このインデックス内の「全体としてテクスチャを持たないメッシュ」の点
+        #    -> ★オクルーダーとして機能 (is_occluder = True)
+        non_tex_mesh_mask = idx_mask & (~mesh_has_tex_flags)
+        if np.any(non_tex_mesh_mask):
+            pts_occ = points[non_tex_mesh_mask]
+            cols_occ = colors[non_tex_mesh_mask]
+            pcd_occ = BasicPointCloud(points=pts_occ, colors=cols_occ, normals=None)
+            gs_occ = VanillaGaussianModel(sh_degree=0)
+            gs_occ.create_from_pcd(pcd_occ, spatial_lr_scale=camera_extent)
+            gs_occ._opacity.data = torch.ones_like(gs_occ._opacity.data) * 4.595
+            render_layers_by_idx[idx].append((gs_occ, True))  # is_occluder = True
 
-    print(f"  -> ガウシアン化完了: {output_gs_path} (インデックスレイヤー数: {len(sub_gaussians_by_idx)})")
-    return full_gaussian, sub_gaussians_by_idx
+        # 2. このインデックス内の「テクスチャを持つメッシュ」のうち、「テクスチャが存在する領域の点」
+        #    -> ★マスク描画対象 (is_occluder = False)
+        #    ※「テクスチャが存在するメッシュ内のテクスチャがない領域」はここに含めず完全透過(スルー)！
+        tex_part_mask = idx_mask & mesh_has_tex_flags & pt_has_tex
+        if np.any(tex_part_mask):
+            pts_tex = points[tex_part_mask]
+            cols_tex = colors[tex_part_mask]
+            pcd_tex = BasicPointCloud(points=pts_tex, colors=cols_tex, normals=None)
+            gs_tex = VanillaGaussianModel(sh_degree=0)
+            gs_tex.create_from_pcd(pcd_tex, spatial_lr_scale=camera_extent)
+            gs_tex._opacity.data = torch.ones_like(gs_tex._opacity.data) * 4.595
+            render_layers_by_idx[idx].append((gs_tex, False))  # is_occluder = False
+
+    print(f"  -> ガウシアン化完了: {output_gs_path} (インデックスレイヤー数: {len(render_layers_by_idx)})")
+    return full_gaussian, render_layers_by_idx
 
 
 # ==============================================================================
@@ -361,77 +389,69 @@ def load_base_scene(
 
 # ==============================================================================
 # 3. 【内部Zバッファ合成方式】による2Dシルエットマスク自動生成
-#    (3D座標を動かさず、ピクセル単位の深度テストとインデックス優先度で合成)
+#    (テクスチャなしメッシュのみオクルーダー化 / テクスチャありメッシュの余白は完全透過)
 # ==============================================================================
 def render_mesh_silhouette_mask_with_zbuffer(
-    sub_gaussians_by_idx: Dict[int, Tuple[VanillaGaussianModel, bool]],
+    render_layers_by_idx: Dict[int, List[Tuple[VanillaGaussianModel, bool]]],
     cam,
     pipe: PipelineParams,
     depth_tolerance: float = 0.005,
 ) -> Tuple[torch.Tensor, Image.Image]:
     """
     【内部Zバッファ合成アルゴリズム】
-    3D座標は1ミリも変更せず、PyTorch上でピクセル単位のZバッファテストを実行:
-    1. 各メッシュのレンダリング深度マップ (depth_3dgs) を比較。
-    2. 深度が手前にあるメッシュがZバッファを更新。
-    3. 同一平面（|D1 - D2| <= depth_tolerance: Z-fighting領域）では、インデックス番号が大きいメッシュが優先上書き。
-    4. 手前になったメッシュがテクスチャありならマスクを「白(True)」、なし(オクルーダー)なら「黒(False)」で上書き。
+    ・3D座標は完全固定。
+    ・インデックス昇順でレンダリング＆Zバッファ更新。
+    ・「テクスチャなしメッシュモデル」: 手前の場合は mask_buffer = False (黒) で奥を遮蔽。
+    ・「テクスチャありメッシュモデルのテクスチャ領域」: 手前の場合は mask_buffer = True (白) で上書き。
+    ・「テクスチャありメッシュモデル内のテクスチャなし余白」: オクルーダー遮断を行わず完全透過（奥のテクスチャをそのまま維持）。
     """
     H, W = cam.image_height, cam.image_width
     bg_black = torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32, device="cuda")
 
-    # 内部Zバッファ (初期値: 無限遠) と 2Dマスクバッファ (初期値: 全て黒/False)
     z_buffer = torch.full((H, W), float("inf"), dtype=torch.float32, device="cuda")
     mask_buffer = torch.zeros((H, W), dtype=torch.bool, device="cuda")
 
-    # インデックス昇順 (0 -> 1 -> ... -> 最大番号) でレンダリング・Zテスト
-    sorted_indices = sorted(sub_gaussians_by_idx.keys())
+    sorted_indices = sorted(render_layers_by_idx.keys())
 
     for idx in sorted_indices:
-        sub_gs, has_tex = sub_gaussians_by_idx[idx]
+        layers = render_layers_by_idx[idx]
 
-        # 3D座標は元のままレンダリング
-        render_pkg = render(
-            viewpoint_camera=cam,
-            pc=sub_gs,
-            pipe=pipe,
-            bg_color=bg_black,
-        )
-        
-        rendered_image = render_pkg["render"]        # (3, H, W)
-        rendered_depth = render_pkg["depth_3dgs"][0] # (H, W)
+        for sub_gs, is_occluder in layers:
+            render_pkg = render(
+                viewpoint_camera=cam,
+                pc=sub_gs,
+                pipe=pipe,
+                bg_color=bg_black,
+            )
+            
+            rendered_image = render_pkg["render"]
+            rendered_depth = render_pkg["depth_3dgs"][0]
 
-        # メッシュが描画されている有効ピクセル
-        valid_pixel = (rendered_image.max(dim=0)[0] > 0.01) & (rendered_depth > 0.001)
+            valid_pixel = (rendered_image.max(dim=0)[0] > 0.01) & (rendered_depth > 0.001)
 
-        # Zテスト条件:
-        # A. 明確に手前にある場合: rendered_depth < (z_buffer - depth_tolerance)
-        # B. 同一平面 (Z-fighting 領域): |rendered_depth - z_buffer| <= depth_tolerance
-        #    (昇順で処理しているため、同等深度ならインデックスが大きい方が手前として上書き)
-        is_closer = rendered_depth < (z_buffer - depth_tolerance)
-        is_coplanar_higher = torch.abs(rendered_depth - z_buffer) <= depth_tolerance
+            # Zテスト (手前 または 同一平面でのインデックス優先)
+            is_closer = rendered_depth < (z_buffer - depth_tolerance)
+            is_coplanar_higher = torch.abs(rendered_depth - z_buffer) <= depth_tolerance
 
-        update_pixels = valid_pixel & (is_closer | is_coplanar_higher)
+            update_pixels = valid_pixel & (is_closer | is_coplanar_higher)
 
-        # Zバッファの更新
-        z_buffer[update_pixels] = rendered_depth[update_pixels]
+            # Zバッファの更新
+            z_buffer[update_pixels] = rendered_depth[update_pixels]
 
-        # マスクバッファの更新 (ペインターズ＆オクルージョン)
-        if has_tex:
-            # テクスチャありメッシュが手前: 白 (True) で上書き
-            mask_buffer[update_pixels] = True
-        else:
-            # テクスチャなしメッシュ (オクルーダー) が手前: 黒 (False) で上書き遮蔽！
-            mask_buffer[update_pixels] = False
+            if is_occluder:
+                # ★テクスチャなしメッシュモデル全体: 手前の場合は黒(False)で奥の白を遮蔽！
+                mask_buffer[update_pixels] = False
+            else:
+                # ★テクスチャありメッシュのテクスチャ領域: 手前の場合は白(True)で描画！
+                mask_buffer[update_pixels] = True
 
-    # 最終的な 2D 白黒画像を出力
     mask_np = (mask_buffer.cpu().numpy() * 255).astype(np.uint8)
     mask_image = Image.fromarray(mask_np, mode="L")
     return mask_buffer, mask_image
 
 
 def generate_multiview_masks(
-    sub_gaussians_by_idx: Dict[int, Tuple[VanillaGaussianModel, bool]],
+    render_layers_by_idx: Dict[int, List[Tuple[VanillaGaussianModel, bool]]],
     cameras: List,
     output_dir: str,
     pipe: PipelineParams,
@@ -446,7 +466,7 @@ def generate_multiview_masks(
     saved_count = 0
     for idx, cam in enumerate(cameras):
         mask_tensor, mask_image = render_mesh_silhouette_mask_with_zbuffer(
-            sub_gaussians_by_idx=sub_gaussians_by_idx,
+            render_layers_by_idx=render_layers_by_idx,
             cam=cam,
             pipe=pipe,
             depth_tolerance=depth_tolerance,
@@ -470,7 +490,6 @@ def merge_and_save_scene(
     before_count = base_gaussian.get_xyz.shape[0]
     add_count = obj_gaussian.get_xyz.shape[0]
 
-    # 3D座標は一切動かさず、そのまま直接マージ
     base_gaussian.concat_gaussians(obj_gaussian)
     after_count = base_gaussian.get_xyz.shape[0]
 
@@ -486,7 +505,7 @@ def merge_and_save_scene(
 # ==============================================================================
 def main():
     parser = argparse.ArgumentParser(
-        description="【配置済みGLB用】内部Zバッファ合成方式により3D座標を動かさずZ-fighting解消＆オクルージョン処理を行うプログラム"
+        description="【配置済みGLB用】テクスチャありメッシュの余白は透過し、テクスチャなしメッシュのみオクルーダー遮蔽する高精度2Dマスク生成＆統合プログラム"
     )
     # 必須・基本入力
     parser.add_argument("--mesh", "-m", type=str, required=True, help="Blender等で配置済みの3Dメッシュファイル (.glb 推奨, .gltf, .obj等)")
@@ -507,9 +526,9 @@ def main():
     args = parser.parse_args()
     pipe = PipelineParams(parser=argparse.ArgumentParser(), sent_args=[])
 
-    # 1. GLBメッシュのガウシアン化 & インデックス・テクスチャ識別
+    # 1. GLBメッシュのガウシアン化 & レイヤー分類
     temp_gs_path = "temp_mesh_gs.ply"
-    full_gaussian, sub_gaussians_by_idx = convert_mesh_to_gaussian(
+    full_gaussian, render_layers_by_idx = convert_mesh_to_gaussian(
         mesh_path=args.mesh,
         output_gs_path=temp_gs_path,
         num_points=args.num_points,
@@ -525,23 +544,22 @@ def main():
     train_cams = scene.getTrainCameras()
     cam = train_cams[min(args.cam_id, len(train_cams) - 1)]
 
-    # 3. ★【内部Zバッファ合成方式】による2Dシルエットマスクの自動抽出・保存
-    # (3D座標は1ミリも動かさず、深度比較とインデックス優先度で手前判定＆遮蔽)
+    # 3. ★【インテリジェント遮蔽 ＆ 内部Zバッファ合成】による2Dマスク生成
     if args.save_mask:
         _, mask_img = render_mesh_silhouette_mask_with_zbuffer(
-            sub_gaussians_by_idx=sub_gaussians_by_idx,
+            render_layers_by_idx=render_layers_by_idx,
             cam=cam,
             pipe=pipe,
             depth_tolerance=args.depth_tolerance,
         )
         os.makedirs(os.path.dirname(os.path.abspath(args.save_mask)), exist_ok=True)
         mask_img.save(args.save_mask)
-        print(f"\n[Mask] カメラ {args.cam_id} から見た内部Zバッファ合成済み2Dマスクを保存しました: {args.save_mask}")
+        print(f"\n[Mask] カメラ {args.cam_id} から見た高精度2Dマスクを保存しました: {args.save_mask}")
 
     # （任意）全視点からのマルチビュー2Dマスク一括出力
     if args.multiview_mask_dir:
         generate_multiview_masks(
-            sub_gaussians_by_idx=sub_gaussians_by_idx,
+            render_layers_by_idx=render_layers_by_idx,
             cameras=train_cams,
             output_dir=args.multiview_mask_dir,
             pipe=pipe,
