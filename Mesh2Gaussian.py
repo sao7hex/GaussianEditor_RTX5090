@@ -17,7 +17,7 @@ Blenderなどの3Dソフトウェア上で既存シーンの点群に合わせ�
 3. 【内部Zバッファ合成方式によるZ-fighting解消】
    3D座標は1ミリも動かさず、PyTorch上で内部的なZバッファ（深度バッファテスト）を管理。
    同一平面上の重なりポリゴンでは「最大インデックス番号のメッシュ」を優先して手前として判定。
-4. 座標変換（回転・移動・スケーリング）を一切挟まず、GaussianModel.concat_gaussians で既存シーンに直接結合してPLY保存。
+4. 座標系自動補正: COLMAP座標系 (Y-Down, Z-Forward) と glTF規格 (Y-Up, -Z Forward) の不一致を解消するため、デフォルトでX軸180度回転 (--rotate_x 180.0) を自動適用して既存シーンと完全整合。GaussianModel.concat_gaussians で直接結合してPLY保存。
 """
 
 import os
@@ -211,13 +211,59 @@ def sample_colors_from_submesh(
     return np.full((n_pts, 3), default_color, dtype=np.float32), has_tex_mask
 
 
+
+def apply_euler_rotation(points: np.ndarray, rx_deg: float, ry_deg: float, rz_deg: float) -> np.ndarray:
+    """
+    点群に対してオイラー角 (度) による3軸回転を適用する。
+    rx_deg=180.0, ry_deg=0.0, rz_deg=0.0 (COLMAP/glTF座標軸補正) の場合は厳密な符号反転 (Y -> -Y, Z -> -Z) を行う。
+    """
+    if rx_deg == 0.0 and ry_deg == 0.0 and rz_deg == 0.0:
+        return points
+
+    # X軸180度のみの場合は誤差のない直接符号反転 (Y -> -Y, Z -> -Z)
+    if rx_deg == 180.0 and ry_deg == 0.0 and rz_deg == 0.0:
+        pts = points.copy()
+        pts[:, 1] = -pts[:, 1]
+        pts[:, 2] = -pts[:, 2]
+        return pts
+
+    rad_x = np.radians(rx_deg)
+    rad_y = np.radians(ry_deg)
+    rad_z = np.radians(rz_deg)
+
+    Rx = np.array([
+        [1, 0, 0],
+        [0, np.cos(rad_x), -np.sin(rad_x)],
+        [0, np.sin(rad_x), np.cos(rad_x)]
+    ], dtype=np.float32)
+
+    Ry = np.array([
+        [np.cos(rad_y), 0, np.sin(rad_y)],
+        [0, 1, 0],
+        [-np.sin(rad_y), 0, np.cos(rad_y)]
+    ], dtype=np.float32)
+
+    Rz = np.array([
+        [np.cos(rad_z), -np.sin(rad_z), 0],
+        [np.sin(rad_z), np.cos(rad_z), 0],
+        [0, 0, 1]
+    ], dtype=np.float32)
+
+    R = Rz @ Ry @ Rx
+    return (points @ R.T).astype(np.float32)
+
+
 def sample_mesh_with_texture_and_priority(
     mesh_path: str,
-    num_points: int = 200000
+    num_points: int = 200000,
+    rotate_x: float = 180.0,
+    rotate_y: float = 0.0,
+    rotate_z: float = 0.0,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     GLBメッシュを読み込み、各サブメッシュのインデックス番号とテクスチャ属性を抽出。
     points, colors, pt_has_tex, priorities, mesh_has_tex_flag を返す。
+    デフォルトでCOLMAP座標系とglTF規格の不一致を補正するためX軸180度回転 (rotate_x=180.0) を適用。
     """
     loaded = trimesh.load(mesh_path, process=False)
 
@@ -285,6 +331,11 @@ def sample_mesh_with_texture_and_priority(
     priorities = np.concatenate(all_priorities, axis=0).astype(np.int32)
     mesh_has_tex_flags = np.concatenate(all_mesh_has_tex, axis=0).astype(bool)
 
+    # 座標系補正 (COLMAP系 OpenCV: Y-Down, Z-Forward vs glTF OpenGL: Y-Up, -Z Forward)
+    if rotate_x != 0.0 or rotate_y != 0.0 or rotate_z != 0.0:
+        points = apply_euler_rotation(points, rotate_x, rotate_y, rotate_z)
+        print(f"  -> [座標系補正] メッシュ点群に回転補正を適用: X={rotate_x}°, Y={rotate_y}°, Z={rotate_z}°")
+
     unique_priorities = np.unique(priorities)
     tex_points_cnt = np.sum(pt_has_tex)
     print(f"  -> 検出されたメッシュインデックス一覧: {unique_priorities.tolist()} (最大値: {int(np.max(unique_priorities))} が最前面)")
@@ -298,6 +349,9 @@ def convert_mesh_to_gaussian(
     output_gs_path: str,
     num_points: int = 200000,
     camera_extent: float = 1.0,
+    rotate_x: float = 180.0,
+    rotate_y: float = 0.0,
+    rotate_z: float = 0.0,
 ) -> Tuple[VanillaGaussianModel, Dict[int, List[Tuple[VanillaGaussianModel, bool]]], Tuple[np.ndarray, np.ndarray]]:
     """
     GLBメッシュをガウシアン化し、以下を返す:
@@ -311,7 +365,13 @@ def convert_mesh_to_gaussian(
     print(f"\n[Step 1] GLBメッシュのガウシアン化を開始: {mesh_path}")
     os.makedirs(os.path.dirname(os.path.abspath(output_gs_path)), exist_ok=True)
 
-    points, colors, pt_has_tex, priorities, mesh_has_tex_flags = sample_mesh_with_texture_and_priority(mesh_path, num_points)
+    points, colors, pt_has_tex, priorities, mesh_has_tex_flags = sample_mesh_with_texture_and_priority(
+        mesh_path=mesh_path,
+        num_points=num_points,
+        rotate_x=rotate_x,
+        rotate_y=rotate_y,
+        rotate_z=rotate_z,
+    )
     mesh_bounds = (points.min(axis=0), points.max(axis=0))
 
     # 全体モデルの初期化 (座標は一切変換しない)
@@ -540,6 +600,7 @@ def generate_multiview_masks(
     print(f"\n[Mask Generation] 内部Zバッファ合成による2Dシルエットマスク一括生成を開始...")
 
     saved_count = 0
+    non_empty_count = 0
     for idx, cam in enumerate(cameras):
         mask_tensor, mask_image = render_mesh_silhouette_mask_with_zbuffer(
             render_layers_by_idx=render_layers_by_idx,
@@ -547,11 +608,12 @@ def generate_multiview_masks(
             pipe=pipe,
             depth_tolerance=depth_tolerance,
         )
+        mask_filename = os.path.join(output_dir, f"mask_cam_{idx:04d}.png")
+        mask_image.save(mask_filename)
+        saved_count += 1
         if mask_tensor.sum() > 0:
-            mask_filename = os.path.join(output_dir, f"mask_cam_{idx:04d}.png")
-            mask_image.save(mask_filename)
-            saved_count += 1
-    print(f"  -> 正確な2Dシルエットマスクを {saved_count} 視点保存しました: {output_dir}")
+            non_empty_count += 1
+    print(f"  -> 全 {saved_count} カメラ視点の2Dマスクを保存しました (内、メッシュ検出: {non_empty_count} 視点): {output_dir}")
 
 
 # ==============================================================================
@@ -843,6 +905,12 @@ def main():
     parser.add_argument("--cam_id", type=int, default=0, help="2Dマスクをレンダリング保存する基準カメラのID (デフォルト: 0)")
     parser.add_argument("--depth_tolerance", type=float, default=0.005, help="同一平面判定トレランス (Z-fighting解消用, デフォルト: 0.005)")
 
+    # 座標系補正 (COLMAP系/glTF系の不一致を解消するため、デフォルトでX軸180度回転が有効)
+    parser.add_argument("--rotate_x", type=float, default=180.0, help="メッシュに適用するX軸回転角度(度)。デフォルト: 180.0 (COLMAP/OpenGL軸補正)")
+    parser.add_argument("--rotate_y", type=float, default=0.0, help="メッシュに適用するY軸回転角度(度)。デフォルト: 0.0")
+    parser.add_argument("--rotate_z", type=float, default=0.0, help="メッシュに適用するZ軸回転角度(度)。デフォルト: 0.0")
+    parser.add_argument("--no_rotate_x", action="store_true", default=False, help="X軸180度回転補正を無効化する (デフォルトは補正有効)")
+
     # 自動処理フラグ (デフォルトで True。スキップしたい場合のみ --no_* を指定)
     parser.add_argument("--no_prune", action="store_true", default=False, help="不要な重複点群の自動削除を無効化する")
     parser.add_argument("--prune_margin", type=float, default=0.02, help="重複点判定時のバウンディングボックス／深度マージン (デフォルト: 0.02)")
@@ -919,12 +987,18 @@ def main():
     multiview_enabled = not args.no_multiview
     multiview_mask_dir = args.multiview_mask_dir if args.multiview_mask_dir else os.path.join(output_masks_dir, "multiview")
 
+    # 回転補正角度の算出 (デフォルトでX軸180度補正が有効)
+    rot_x = 0.0 if args.no_rotate_x else args.rotate_x
+    rot_y = args.rotate_y
+    rot_z = args.rotate_z
+
     print("=" * 70)
     print("【Mesh2Gaussian 実行構成】")
     print(f"  ・データ基底フォルダ : {os.path.abspath(base_dir)}")
     print(f"  ・3Dメッシュ入力     : {mesh_path}")
     print(f"  ・Colmapデータセット : {source_path}")
     print(f"  ・3DGSモデル入力     : {model_path}")
+    print(f"  ・座標系回転補正     : X={rot_x}°, Y={rot_y}°, Z={rot_z}° {'(デフォルトX軸180°補正有効)' if rot_x == 180.0 else ''}")
     print(f"  ・出力PLYファイル    : {output_ply}")
     print(f"  ・単一2Dマスク保存先 : {save_mask}")
     print(f"  ・全カメラマスク保存 : {'有効 (フォルダ: ' + multiview_mask_dir + ')' if multiview_enabled else '無効'}")
@@ -942,6 +1016,9 @@ def main():
         mesh_path=mesh_path,
         output_gs_path=temp_gs_path,
         num_points=args.num_points,
+        rotate_x=rot_x,
+        rotate_y=rot_y,
+        rotate_z=rot_z,
     )
 
     # --------------------------------------------------------------------------
