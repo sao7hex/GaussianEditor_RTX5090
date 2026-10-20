@@ -519,7 +519,14 @@ def load_base_scene(
         else:
             print(f"  [Notice] 学習済みモデル (point_cloud/) が見つからなかったため、Colmapの初期疎点群を使用します。")
 
-    print(f"  -> シーン読み込み成功 (既存点数: {base_gaussian.get_xyz.shape[0]:,}, カメラ数: {len(scene.getTrainCameras())})")
+    # ロード後の点数に合わせて補助バッファ（max_radii2D等）を安全に初期化・同期
+    curr_n_pts = base_gaussian.get_xyz.shape[0]
+    if hasattr(base_gaussian, "max_radii2D"):
+        base_gaussian.max_radii2D = torch.zeros(curr_n_pts, device="cuda")
+    if hasattr(base_gaussian, "_generation"):
+        base_gaussian._generation = torch.zeros(curr_n_pts, dtype=torch.int64, device="cuda")
+
+    print(f"  -> シーン読み込み成功 (既存点数: {curr_n_pts:,}, カメラ数: {len(scene.getTrainCameras())})")
     return base_gaussian, scene
 
 
@@ -711,9 +718,15 @@ def prune_overlapping_gaussians(
             base_gaussian._scaling = torch.nn.Parameter(base_gaussian._scaling[keep_mask].requires_grad_(True))
             base_gaussian._rotation = torch.nn.Parameter(base_gaussian._rotation[keep_mask].requires_grad_(True))
             if hasattr(base_gaussian, "max_radii2D") and base_gaussian.max_radii2D is not None:
-                base_gaussian.max_radii2D = base_gaussian.max_radii2D[keep_mask]
+                if len(base_gaussian.max_radii2D) == N:
+                    base_gaussian.max_radii2D = base_gaussian.max_radii2D[keep_mask]
+                else:
+                    base_gaussian.max_radii2D = torch.zeros(base_gaussian.get_xyz.shape[0], device=xyz.device)
             if hasattr(base_gaussian, "_generation") and base_gaussian._generation is not None:
-                base_gaussian._generation = base_gaussian._generation[keep_mask]
+                if len(base_gaussian._generation) == N:
+                    base_gaussian._generation = base_gaussian._generation[keep_mask]
+                else:
+                    base_gaussian._generation = torch.zeros(base_gaussian.get_xyz.shape[0], dtype=torch.int64, device=xyz.device)
 
         print(f"  -> 遮蔽・重複していた既存ガウシアン {num_pruned:,} 点を自動削除しました！ (残存: {base_gaussian.get_xyz.shape[0]:,} 点)")
     else:
