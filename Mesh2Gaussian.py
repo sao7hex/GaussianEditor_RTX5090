@@ -247,20 +247,56 @@ def sample_mesh_with_texture_and_priority(
 
     indexed_submeshes = []
     if isinstance(loaded, trimesh.Scene):
-        for default_idx, (name, geom) in enumerate(loaded.geometry.items()):
-            if isinstance(geom, trimesh.Trimesh) and len(geom.vertices) > 0 and len(geom.faces) > 0:
-                # ★ GLB内で最初（0番目＝default_idx == 0）に出現するメッシュを除外（include_first_mesh=False時）
-                if default_idx == 0 and not include_first_mesh:
-                    print(f"  -> [除外] GLBの先頭（0番目）メッシュをスキップ: {name} (index: {default_idx})")
-                    continue
-                elif default_idx == 0 and include_first_mesh:
-                    print(f"  -> [保持] GLBの先頭（0番目）メッシュも含めて処理します: {name} (index: {default_idx})")
+        parents_map = getattr(loaded.graph.transforms, "parents", {})
+        base_frame = loaded.graph.base_frame
 
-                mesh_idx = extract_mesh_index(name, default_idx)
-                transform = loaded.graph.get(name)[0] if name in loaded.graph else np.eye(4)
-                geom_transformed = geom.copy()
-                geom_transformed.apply_transform(transform)
-                indexed_submeshes.append((geom_transformed, mesh_idx, name))
+        # シーングラフのノードを走査し、親ノードからの累積変換行列を正確に計算
+        mesh_count = 0
+        nodes_with_mesh = []
+        for default_idx, node_name in enumerate(loaded.graph.nodes):
+            geom_name = loaded.graph.transforms.node_data.get(node_name, {}).get("geometry", None)
+            if geom_name is None and node_name in loaded.geometry:
+                geom_name = node_name
+            if geom_name is not None and geom_name in loaded.geometry:
+                nodes_with_mesh.append((default_idx, node_name, geom_name))
+
+        # node_data から取得できなかった場合は geometry.items() をフォールバック利用
+        if len(nodes_with_mesh) == 0:
+            for default_idx, (name, _) in enumerate(loaded.geometry.items()):
+                nodes_with_mesh.append((default_idx, name, name))
+
+        for default_idx, node_name, geom_name in nodes_with_mesh:
+            geom = loaded.geometry[geom_name]
+            if not isinstance(geom, trimesh.Trimesh) or len(geom.vertices) == 0 or len(geom.faces) == 0:
+                continue
+
+            # ★ GLB内で最初（0番目）に出現するメッシュを除外（include_first_mesh=False時）
+            if mesh_count == 0 and not include_first_mesh:
+                print(f"  -> [除外] GLBの先頭（0番目）メッシュをスキップ: ノード={node_name}, ジオメトリ={geom_name}")
+                mesh_count += 1
+                continue
+            elif mesh_count == 0 and include_first_mesh:
+                print(f"  -> [保持] GLBの先頭（0番目）メッシュも含めて処理します: ノード={node_name}")
+            mesh_count += 1
+
+            # 親ノードの取得と階層行列の合成計算 (T_parent_world @ T_child_local)
+            parent_node = parents_map.get(node_name, base_frame)
+            try:
+                # 親ノードのワールド変換行列
+                T_parent_world, _ = loaded.graph.get(frame_to=parent_node, frame_from=base_frame)
+                # 親に対する子ノードのローカル変換行列
+                T_child_local, _ = loaded.graph.get(frame_to=node_name, frame_from=parent_node)
+                # 親ノードの行列と子のローカル行列を行列積で合成
+                transform = T_parent_world @ T_child_local
+                print(f"  -> [親ノード行列合成] ノード '{node_name}' (親: '{parent_node}') の変換行列を適用")
+            except Exception:
+                # 万が一のフォールバック (単一ノード直接取得)
+                transform = loaded.graph.get(node_name)[0] if node_name in loaded.graph else np.eye(4)
+
+            mesh_idx = extract_mesh_index(node_name, default_idx)
+            geom_transformed = geom.copy()
+            geom_transformed.apply_transform(transform)
+            indexed_submeshes.append((geom_transformed, mesh_idx, node_name))
     elif isinstance(loaded, trimesh.Trimesh):
         # 単一メッシュしかない場合は警告しつつ保持
         print("  -> [Warning] 単一のTrimeshオブジェクトが読み込まれたため、先頭除外をスキップして処理します。")
