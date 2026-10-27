@@ -100,6 +100,8 @@ GaussianEditor_RTX5090/
     │
     └── output/                         # ★すべての出力がここに自動集約されます
         ├── merged_refined.ply          # 最終PLYファイル (自動生成)
+        ├── logs/
+        │   └── mesh_log.txt            # メッシュ解析・点数配分ログ (自動生成)
         └── masks/
             ├── mask_cam0.png           # 基準カメラの2Dシルエットマスク (自動生成)
             └── multiview/              # 全カメラ視点の2Dマスク群 (自動生成)
@@ -148,6 +150,7 @@ python Mesh2Gaussian.py --no_refine
 | `--model_path` | - | `source_path` | 学習済み3DGSモデルディレクトリ |
 | `--iteration` | - | `-1` (最新) | 読み込む学習済みチェックポイント番号 |
 | `--output_ply` | `-o` | `data_dir/output/merged_refined.ply` | 最終結合PLYファイルの保存先 |
+| `--mesh_log_path` | - | `data_dir/output/logs/mesh_log.txt` | メッシュ解析・点数配分ログファイルの保存先 |
 | `--save_mask` | - | `data_dir/output/masks/mask_cam0.png` | 基準カメラの2Dマスク保存先 |
 | `--multiview_mask_dir` | - | `data_dir/output/masks/multiview` | 全カメラ2Dマスク一括保存先フォルダ（デフォルト有効） |
 | `--no_multiview` | - | `False` (全視点マスク生成有効) | 全カメラ視点の2Dマスク一括生成を無効化するフラグ |

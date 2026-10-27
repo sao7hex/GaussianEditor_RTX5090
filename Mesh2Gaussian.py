@@ -235,13 +235,28 @@ def sample_mesh_with_texture_and_priority(
     rotate_x: float = 0.0,
     rotate_y: float = 0.0,
     rotate_z: float = 0.0,
+    mesh_log_path: Optional[str] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     GLBメッシュを読み込み、0番目のメッシュを除外した上でサンプリングを行う。
     points, colors, priorities を返す。
     デフォルトでは回転補正なし (rotate_x=0.0)。必要に応じてオイラー角を適用可能。
+    mesh_log_path が指定されている場合、メッシュ一覧とサンプリング結果をログファイルに保存する。
     """
     loaded = trimesh.load(mesh_path, process=False)
+
+    log_lines = [
+        "=" * 70,
+        "【Mesh2Gaussian メッシュ解析・サンプリングログ】",
+        f"・入力メッシュ: {os.path.abspath(mesh_path)}",
+        f"・サンプリング目標点数: {num_points:,} 点",
+        f"・回転補正: X={rotate_x}°, Y={rotate_y}°, Z={rotate_z}°",
+        "=" * 70,
+    ]
+
+    def log(msg: str):
+        print(msg)
+        log_lines.append(msg)
 
     indexed_submeshes = []
     if isinstance(loaded, trimesh.Scene):
@@ -263,18 +278,22 @@ def sample_mesh_with_texture_and_priority(
             for default_idx, (name, _) in enumerate(loaded.geometry.items()):
                 nodes_with_mesh.append((default_idx, name, name))
 
+        log(f"  -> GLB内の全メッシュ検出・解析 (全 {len(nodes_with_mesh)} 個):")
         for default_idx, node_name, geom_name in nodes_with_mesh:
             geom = loaded.geometry[geom_name]
             if not isinstance(geom, trimesh.Trimesh) or len(geom.vertices) == 0 or len(geom.faces) == 0:
+                log(f"     [スキップ] 空のジオメトリ: ノード='{node_name}'")
                 continue
 
             mesh_idx = extract_mesh_index(node_name, default_idx)
 
-            # ★ 0番目のメッシュ（先頭メッシュ または インデックス0）を常に除外
-            if mesh_count == 0 or mesh_idx == 0:
-                print(f"  -> [除外] 0番目のメッシュをスキップ: ノード={node_name}, ジオメトリ={geom_name} (index: {mesh_idx})")
+            # ★ GLB内で最初（0番目＝mesh_count == 0）に出現するメッシュのみを除外！
+            if mesh_count == 0:
+                log(f"     [除外] ★ 0番目（先頭）メッシュをスキップ: ノード='{node_name}', ジオメトリ='{geom_name}' (頂点数: {len(geom.vertices):,})")
                 mesh_count += 1
                 continue
+
+            log(f"     [採用] メッシュ #{mesh_count}: ノード='{node_name}', ジオメトリ='{geom_name}' (Index: {mesh_idx}, 頂点数: {len(geom.vertices):,})")
             mesh_count += 1
 
             # 親ノードの取得と階層行列の合成計算 (T_parent_world @ T_child_local)
@@ -286,7 +305,6 @@ def sample_mesh_with_texture_and_priority(
                 T_child_local, _ = loaded.graph.get(frame_to=node_name, frame_from=parent_node)
                 # 親ノードの行列と子のローカル行列を行列積で合成
                 transform = T_parent_world @ T_child_local
-                print(f"  -> [親ノード行列合成] ノード '{node_name}' (親: '{parent_node}') の変換行列を適用")
             except Exception:
                 # 万が一のフォールバック (単一ノード直接取得)
                 transform = loaded.graph.get(node_name)[0] if node_name in loaded.graph else np.eye(4)
@@ -296,7 +314,7 @@ def sample_mesh_with_texture_and_priority(
             indexed_submeshes.append((geom_transformed, mesh_idx, node_name))
     elif isinstance(loaded, trimesh.Trimesh):
         # 単一メッシュしかない場合は警告しつつ保持
-        print("  -> [Warning] 単一のTrimeshオブジェクトが読み込まれたため、先頭除外をスキップして処理します。")
+        log("  -> [Warning] 単一のTrimeshオブジェクトが読み込まれたため、先頭除外をスキップして処理します。")
         indexed_submeshes.append((loaded, 0, "root"))
     else:
         raise ValueError(f"対応していないメッシュ形式です: {type(loaded)}")
@@ -310,9 +328,13 @@ def sample_mesh_with_texture_and_priority(
         for s_mesh, s_idx in split_results:
             final_submeshes.append((s_mesh, s_idx, name))
 
+    # 各メッシュの面積比率計算と最小サンプリング点数の保証 (極小メッシュでも消えないようにする)
     areas = np.array([max(m[0].area, 1e-9) for m in final_submeshes], dtype=np.float64)
     weights = areas / np.sum(areas)
-    sub_counts = np.round(weights * num_points).astype(int)
+
+    min_pts_guarantee = min(1000, max(100, num_points // (len(final_submeshes) * 5)))
+    raw_counts = np.round(weights * (num_points - min_pts_guarantee * len(final_submeshes))).astype(int)
+    sub_counts = np.maximum(raw_counts + min_pts_guarantee, min_pts_guarantee)
 
     diff = num_points - np.sum(sub_counts)
     if diff != 0:
@@ -322,10 +344,13 @@ def sample_mesh_with_texture_and_priority(
     all_colors = []
     all_priorities = []
 
-    print(f"  -> メッシュモデルのサンプリング:")
+    log(f"\n  -> 各メッシュへのサンプリング点数割り当て結果 (合計: {num_points:,} 点):")
     for (mesh, p_idx, name), count in zip(final_submeshes, sub_counts):
         if count <= 0:
+            log(f"     [スキップ] 点数0: ノード='{name}'")
             continue
+
+        log(f"     ・ノード='{name}' (優先度Index: {p_idx}, 表面積: {mesh.area:.5f}): {count:,} 点をサンプリング")
 
         pts, face_indices = trimesh.sample.sample_surface(mesh, count)
         cols, _ = sample_colors_from_submesh(mesh, pts, face_indices)
@@ -341,11 +366,18 @@ def sample_mesh_with_texture_and_priority(
     # 座標系補正 (COLMAP系 OpenCV: Y-Down, Z-Forward vs glTF OpenGL: Y-Up, -Z Forward)
     if rotate_x != 0.0 or rotate_y != 0.0 or rotate_z != 0.0:
         points = apply_euler_rotation(points, rotate_x, rotate_y, rotate_z)
-        print(f"  -> [座標系補正] メッシュ点群に回転補正を適用: X={rotate_x}°, Y={rotate_y}°, Z={rotate_z}°")
+        log(f"  -> [座標系補正] メッシュ点群に回転補正を適用: X={rotate_x}°, Y={rotate_y}°, Z={rotate_z}°")
 
     unique_priorities = np.unique(priorities)
-    print(f"  -> 検出されたメッシュインデックス一覧: {unique_priorities.tolist()} (最大値: {int(np.max(unique_priorities))} が最前面)")
-    print(f"  -> 点単位サンプリング内訳: 全 {len(points):,} 点を生成")
+    log(f"  -> 検出されたメッシュインデックス一覧: {unique_priorities.tolist()} (最大値: {int(np.max(unique_priorities))} が最前面)")
+    log(f"  -> 点単位サンプリング内訳: 全 {len(points):,} 点を生成")
+
+    # ログファイルの保存 (output/logs/mesh_log.txt)
+    if mesh_log_path:
+        os.makedirs(os.path.dirname(os.path.abspath(mesh_log_path)), exist_ok=True)
+        with open(mesh_log_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(log_lines) + "\n")
+        print(f"  -> [ログ保存] メッシュ解析ログを保存しました: {mesh_log_path}")
 
     return points, colors, priorities
 
@@ -358,6 +390,7 @@ def convert_mesh_to_gaussian(
     rotate_x: float = 0.0,
     rotate_y: float = 0.0,
     rotate_z: float = 0.0,
+    mesh_log_path: Optional[str] = None,
 ) -> Tuple[VanillaGaussianModel, Dict[int, List[Tuple[VanillaGaussianModel, bool]]], Tuple[np.ndarray, np.ndarray]]:
     """
     GLBメッシュ（0番目メッシュ除外済み）をガウシアン化し、以下を返す:
@@ -368,13 +401,19 @@ def convert_mesh_to_gaussian(
     print(f"\n[Step 1] GLBメッシュのガウシアン化を開始: {mesh_path} (0番目メッシュ除外)")
     os.makedirs(os.path.dirname(os.path.abspath(output_gs_path)), exist_ok=True)
 
+    # ログ出力先が指定されていない場合は output_gs_path と同階層の logs/mesh_log.txt に設定
+    if mesh_log_path is None:
+        mesh_log_path = os.path.join(os.path.dirname(os.path.abspath(output_gs_path)), "logs", "mesh_log.txt")
+
     points, colors, priorities = sample_mesh_with_texture_and_priority(
         mesh_path=mesh_path,
         num_points=num_points,
         rotate_x=rotate_x,
         rotate_y=rotate_y,
         rotate_z=rotate_z,
+        mesh_log_path=mesh_log_path,
     )
+
 
     mesh_bounds = (points.min(axis=0), points.max(axis=0))
 
@@ -899,6 +938,7 @@ def main():
 
     # メッシュ変換＆レンダリング設定
     parser.add_argument("--num_points", "-n", type=int, default=200000, help="サンプリングするガウシアン点数 (デフォルト: 200,000)")
+    parser.add_argument("--mesh_log_path", type=str, default=None, help="メッシュ解析ログの保存先パス (未指定時: output/logs/mesh_log.txt)")
     parser.add_argument("--cam_id", type=int, default=0, help="2Dマスクをレンダリング保存する基準カメラのID (デフォルト: 0)")
     parser.add_argument("--depth_tolerance", type=float, default=0.005, help="同一平面判定トレランス (Z-fighting解消用, デフォルト: 0.005)")
 
@@ -985,6 +1025,8 @@ def main():
     multiview_enabled = not args.no_multiview
     multiview_mask_dir = args.multiview_mask_dir if args.multiview_mask_dir else os.path.join(output_masks_dir, "multiview")
 
+    mesh_log_path = args.mesh_log_path if args.mesh_log_path else os.path.join(output_dir, "logs", "mesh_log.txt")
+
     # 回転補正角度 (デフォルト: 回転なし 0.0)
     rot_x = args.rotate_x
     rot_y = args.rotate_y
@@ -1000,6 +1042,7 @@ def main():
     print(f"  ・出力PLYファイル    : {output_ply}")
     print(f"  ・単一2Dマスク保存先 : {save_mask}")
     print(f"  ・全カメラマスク保存 : {'有効 (フォルダ: ' + multiview_mask_dir + ')' if multiview_enabled else '無効'}")
+    print(f"  ・メッシュ解析ログ   : {mesh_log_path}")
     print(f"  ・先頭メッシュ(0番目): 除外")
     print(f"  ・不要点群自動削除   : {'有効' if auto_prune_enabled else '無効'}")
     print(f"  ・拡散モデルRefine   : {'有効 (Steps: ' + str(args.refine_steps) + ')' if refine_enabled else '無効'}")
@@ -1019,6 +1062,7 @@ def main():
         rotate_x=rot_x,
         rotate_y=rot_y,
         rotate_z=rot_z,
+        mesh_log_path=mesh_log_path,
     )
 
     # --------------------------------------------------------------------------
