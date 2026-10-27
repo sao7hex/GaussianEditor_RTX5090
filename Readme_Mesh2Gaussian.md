@@ -152,10 +152,9 @@ python Mesh2Gaussian.py --no_refine
 | `--multiview_mask_dir` | - | `data_dir/output/masks/multiview` | 全カメラ2Dマスク一括保存先フォルダ（デフォルト有効） |
 | `--no_multiview` | - | `False` (全視点マスク生成有効) | 全カメラ視点の2Dマスク一括生成を無効化するフラグ |
 | `--no_prune` | - | `False` (自動削除有効) | 重複する不要ガウシアンの自動くり抜きを無効化するフラグ |
-| `--rotate_x` | - | `180.0` | X軸周りの回転補正角度 (度)。COLMAP系とglTF系の食い違いを解消するためデフォルトで180度有効 |
+| `--rotate_x` | - | `0.0` | X軸周りの回転補正角度 (度)。デフォルト: 0.0 (回転なし) |
 | `--rotate_y` | - | `0.0` | Y軸周りの回転補正角度 (度) |
 | `--rotate_z` | - | `0.0` | Z軸周りの回転補正角度 (度) |
-| `--no_rotate_x` | - | `False` (X軸180°補正有効) | X軸180度回転補正を無効化するフラグ |
 | `--no_refine` | - | `False` (最適化有効) | 拡散モデルによる境界ブレンディングを無効化するフラグ |
 | `--prompt` | - | `a photorealistic...` | 境界ブレンディング最適化のプロンプト |
 | `--refine_steps` | - | `200` | 最適化ステップ数 |

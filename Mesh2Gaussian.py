@@ -232,14 +232,14 @@ def apply_euler_rotation(points: np.ndarray, rx_deg: float, ry_deg: float, rz_de
 def sample_mesh_with_texture_and_priority(
     mesh_path: str,
     num_points: int = 200000,
-    rotate_x: float = 180.0,
+    rotate_x: float = 0.0,
     rotate_y: float = 0.0,
     rotate_z: float = 0.0,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     GLBメッシュを読み込み、0番目のメッシュを除外した上でサンプリングを行う。
     points, colors, priorities を返す。
-    デフォルトでCOLMAP座標系とglTF規格の不一致を補正するためX軸180度回転 (rotate_x=180.0) を適用。
+    デフォルトでは回転補正なし (rotate_x=0.0)。必要に応じてオイラー角を適用可能。
     """
     loaded = trimesh.load(mesh_path, process=False)
 
@@ -355,7 +355,7 @@ def convert_mesh_to_gaussian(
     output_gs_path: str,
     num_points: int = 200000,
     camera_extent: float = 1.0,
-    rotate_x: float = 180.0,
+    rotate_x: float = 0.0,
     rotate_y: float = 0.0,
     rotate_z: float = 0.0,
 ) -> Tuple[VanillaGaussianModel, Dict[int, List[Tuple[VanillaGaussianModel, bool]]], Tuple[np.ndarray, np.ndarray]]:
@@ -902,11 +902,10 @@ def main():
     parser.add_argument("--cam_id", type=int, default=0, help="2Dマスクをレンダリング保存する基準カメラのID (デフォルト: 0)")
     parser.add_argument("--depth_tolerance", type=float, default=0.005, help="同一平面判定トレランス (Z-fighting解消用, デフォルト: 0.005)")
 
-    # 座標系補正 (COLMAP系/glTF系の不一致を解消するため、デフォルトでX軸180度回転が有効)
-    parser.add_argument("--rotate_x", "--rotate-x", type=float, default=180.0, help="メッシュに適用するX軸回転角度(度)。デフォルト: 180.0 (COLMAP/OpenGL軸補正)")
+    # 座標系補正 (必要に応じて回転角度を指定。デフォルトは回転補正なし: 0.0)
+    parser.add_argument("--rotate_x", "--rotate-x", type=float, default=0.0, help="メッシュに適用するX軸回転角度(度)。デフォルト: 0.0")
     parser.add_argument("--rotate_y", "--rotate-y", type=float, default=0.0, help="メッシュに適用するY軸回転角度(度)。デフォルト: 0.0")
     parser.add_argument("--rotate_z", "--rotate-z", type=float, default=0.0, help="メッシュに適用するZ軸回転角度(度)。デフォルト: 0.0")
-    parser.add_argument("--no_rotate_x", "--no-rotate-x", action="store_true", default=False, help="X軸180度回転補正を無効化する (デフォルトは補正有効)")
 
     # 自動処理フラグ (デフォルトで True。スキップしたい場合のみ --no_* を指定)
     parser.add_argument("--no_prune", "--no-prune", action="store_true", default=False, help="不要な重複点群の自動削除を無効化する")
@@ -986,8 +985,8 @@ def main():
     multiview_enabled = not args.no_multiview
     multiview_mask_dir = args.multiview_mask_dir if args.multiview_mask_dir else os.path.join(output_masks_dir, "multiview")
 
-    # 回転補正角度の算出 (デフォルトでX軸180度補正が有効)
-    rot_x = 0.0 if args.no_rotate_x else args.rotate_x
+    # 回転補正角度 (デフォルト: 回転なし 0.0)
+    rot_x = args.rotate_x
     rot_y = args.rotate_y
     rot_z = args.rotate_z
 
@@ -997,7 +996,7 @@ def main():
     print(f"  ・3Dメッシュ入力     : {mesh_path}")
     print(f"  ・Colmapデータセット : {source_path}")
     print(f"  ・3DGSモデル入力     : {model_path}")
-    print(f"  ・座標系回転補正     : X={rot_x}°, Y={rot_y}°, Z={rot_z}° {'(デフォルトX軸180°補正有効)' if rot_x == 180.0 else ''}")
+    print(f"  ・座標系回転補正     : X={rot_x}°, Y={rot_y}°, Z={rot_z}°")
     print(f"  ・出力PLYファイル    : {output_ply}")
     print(f"  ・単一2Dマスク保存先 : {save_mask}")
     print(f"  ・全カメラマスク保存 : {'有効 (フォルダ: ' + multiview_mask_dir + ')' if multiview_enabled else '無効'}")
@@ -1005,6 +1004,7 @@ def main():
     print(f"  ・不要点群自動削除   : {'有効' if auto_prune_enabled else '無効'}")
     print(f"  ・拡散モデルRefine   : {'有効 (Steps: ' + str(args.refine_steps) + ')' if refine_enabled else '無効'}")
     print("=" * 70)
+
 
     pipe = PipelineParams(argparse.ArgumentParser())
 
