@@ -259,7 +259,7 @@ def sample_mesh_with_texture_and_priority(
     rotate_x: float = 0.0,
     rotate_y: float = 0.0,
     rotate_z: float = 0.0,
-    apply_node_transform: bool = True,
+    apply_node_transform: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     GLBメッシュを読み込み、各サブメッシュのインデックス番号とテクスチャ属性を抽出。
@@ -371,7 +371,7 @@ def convert_mesh_to_gaussian(
     rotate_x: float = 0.0,
     rotate_y: float = 0.0,
     rotate_z: float = 0.0,
-    apply_node_transform: bool = True,
+    apply_node_transform: bool = False,
 ) -> Tuple[VanillaGaussianModel, Dict[int, List[Tuple[VanillaGaussianModel, bool]]], Tuple[np.ndarray, np.ndarray]]:
     """
     GLBメッシュをガウシアン化し、以下を返す:
