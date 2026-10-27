@@ -333,11 +333,12 @@ def sample_mesh_with_texture_and_priority(
     mesh_has_tex_flags = np.concatenate(all_mesh_has_tex, axis=0).astype(bool)
 
     # 座標系補正 (COLMAP系 OpenCV: Y-Down, Z-Forward vs glTF OpenGL: Y-Up, -Z Forward)
-    # 原点 (0, 0, 0) を基準とした Y軸およびZ軸の反転
+    # メッシュの中心座標（重心）を基準とした Y軸およびZ軸の反転（位置を維持したまま向きのみ反転）
     if flip_yz:
-        points[:, 1] = -points[:, 1]
-        points[:, 2] = -points[:, 2]
-        print(f"  -> [座標系補正] メッシュ点群のY軸・Z軸を反転適用: Y -> -Y, Z -> -Z (原点中心)")
+        center = points.mean(axis=0)
+        points[:, 1] = -(points[:, 1] - center[1]) + center[1]
+        points[:, 2] = -(points[:, 2] - center[2]) + center[2]
+        print(f"  -> [座標系補正] メッシュ中心基準でY軸・Z軸を反転適用 (位置を維持: 重心={center.round(3).tolist()})")
 
     if rotate_x != 0.0 or rotate_y != 0.0 or rotate_z != 0.0:
         points = apply_euler_rotation(points, rotate_x, rotate_y, rotate_z)
@@ -1022,7 +1023,7 @@ def main():
     print(f"  ・3Dメッシュ入力     : {mesh_path}")
     print(f"  ・Colmapデータセット : {source_path}")
     print(f"  ・3DGSモデル入力     : {model_path}")
-    print(f"  ・座標系Y/Z軸反転    : {'有効 (Y -> -Y, Z -> -Z, 原点中心)' if flip_yz else '無効'}")
+    print(f"  ・座標系Y/Z軸反転    : {'有効 (メッシュ中心基準, 位置維持)' if flip_yz else '無効'}")
     if rot_x != 0.0 or rot_y != 0.0 or rot_z != 0.0:
         print(f"  ・追加回転角度       : X={rot_x}°, Y={rot_y}°, Z={rot_z}°")
     print(f"  ・出力PLYファイル    : {output_ply}")
