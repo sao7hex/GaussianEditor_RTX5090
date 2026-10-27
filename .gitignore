@@ -207,3 +207,6 @@ ui_result/
 
 # inport export data
 Mesh2Gaussian_data/
+
+# For ask AI
+For_ask_AI_folder/

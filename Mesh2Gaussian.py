@@ -259,7 +259,7 @@ def sample_mesh_with_texture_and_priority(
     rotate_x: float = 0.0,
     rotate_y: float = 0.0,
     rotate_z: float = 0.0,
-    apply_node_transform: bool = False,
+    apply_node_transform: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     GLBメッシュを読み込み、各サブメッシュのインデックス番号とテクスチャ属性を抽出。
@@ -356,7 +356,7 @@ def convert_mesh_to_gaussian(
     rotate_x: float = 0.0,
     rotate_y: float = 0.0,
     rotate_z: float = 0.0,
-    apply_node_transform: bool = False,
+    apply_node_transform: bool = True,
 ) -> Tuple[VanillaGaussianModel, Dict[int, List[Tuple[VanillaGaussianModel, bool]]], Tuple[np.ndarray, np.ndarray]]:
     """
     GLBメッシュをガウシアン化し、以下を返す:
@@ -928,7 +928,7 @@ def main():
     parser.add_argument("--rotate_x", type=float, default=0.0, help="メッシュに適用するX軸回転角度(度)。デフォルト: 0.0")
     parser.add_argument("--rotate_y", type=float, default=0.0, help="メッシュに適用するY軸回転角度(度)。デフォルト: 0.0")
     parser.add_argument("--rotate_z", type=float, default=0.0, help="メッシュに適用するZ軸回転角度(度)。デフォルト: 0.0")
-    parser.add_argument("--apply_node_transform", action="store_true", default=False, help="GLBノードの配置行列(トランスフォーム)を適用する (デフォルト: 無効)")
+    parser.add_argument("--no_node_transform", action="store_true", default=False, help="GLBノードの配置行列(トランスフォーム)適用を無効化する (デフォルトは適用有効)")
 
     # 自動処理フラグ (デフォルトで True。スキップしたい場合のみ --no_* を指定)
     parser.add_argument("--no_prune", action="store_true", default=False, help="不要な重複点群の自動削除を無効化する")
@@ -1007,6 +1007,7 @@ def main():
     multiview_mask_dir = args.multiview_mask_dir if args.multiview_mask_dir else os.path.join(output_masks_dir, "multiview")
 
     # 座標系補正
+    apply_node_transform = not args.no_node_transform
     rot_x = args.rotate_x
     rot_y = args.rotate_y
     rot_z = args.rotate_z
@@ -1017,7 +1018,7 @@ def main():
     print(f"  ・3Dメッシュ入力     : {mesh_path}")
     print(f"  ・Colmapデータセット : {source_path}")
     print(f"  ・3DGSモデル入力     : {model_path}")
-    print(f"  ・GLBトランスフォーム: {'有効 (ノード行列を適用)' if args.apply_node_transform else '無効 (生頂点座標をそのまま使用)'}")
+    print(f"  ・GLBトランスフォーム: {'有効 (main.jsの元位置・スケール復元)' if apply_node_transform else '無効'}")
     print(f"  ・座標系回転補正     : {'X=' + str(rot_x) + '°, Y=' + str(rot_y) + '°, Z=' + str(rot_z) + '°' if (rot_x != 0.0 or rot_y != 0.0 or rot_z != 0.0) else 'なし (0.0°)'}")
     print(f"  ・出力PLYファイル    : {output_ply}")
     print(f"  ・単一2Dマスク保存先 : {save_mask}")
@@ -1039,7 +1040,7 @@ def main():
         rotate_x=rot_x,
         rotate_y=rot_y,
         rotate_z=rot_z,
-        apply_node_transform=args.apply_node_transform,
+        apply_node_transform=apply_node_transform,
     )
 
     # --------------------------------------------------------------------------
