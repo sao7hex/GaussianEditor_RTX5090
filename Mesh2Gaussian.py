@@ -102,30 +102,6 @@ def split_submeshes_by_material(mesh: trimesh.Trimesh, base_idx: int) -> List[Tu
     return [(mesh, base_idx)]
 
 
-def mesh_has_texture(mesh: trimesh.Trimesh) -> bool:
-    """
-    サブメッシュが有効なUV座標および画像テクスチャを持っているかを判定する。
-    """
-    has_uv = hasattr(mesh.visual, "uv") and mesh.visual.uv is not None and len(mesh.visual.uv) > 0
-    if not has_uv:
-        return False
-
-    mat = getattr(mesh.visual, "material", None)
-    if mat is None:
-        return False
-
-    if hasattr(mat, "baseColorTexture") and mat.baseColorTexture is not None:
-        return True
-    if hasattr(mat, "image") and mat.image is not None:
-        return True
-    if hasattr(mat, "materials") and mat.materials is not None:
-        for m in mat.materials:
-            if hasattr(m, "baseColorTexture") and m.baseColorTexture is not None:
-                return True
-            if hasattr(m, "image") and m.image is not None:
-                return True
-
-    return False
 
 
 # ==============================================================================
@@ -259,10 +235,10 @@ def sample_mesh_with_texture_and_priority(
     rotate_x: float = 180.0,
     rotate_y: float = 0.0,
     rotate_z: float = 0.0,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    GLBメッシュを読み込み、各サブメッシュのインデックス番号とテクスチャ属性を抽出。
-    points, colors, pt_has_tex, priorities, mesh_has_tex_flag を返す。
+    GLBメッシュを読み込み、先頭（1番目）メッシュを除外した上でサンプリングを行う。
+    points, colors, priorities を返す。
     デフォルトでCOLMAP座標系とglTF規格の不一致を補正するためX軸180度回転 (rotate_x=180.0) を適用。
     """
     loaded = trimesh.load(mesh_path, process=False)
@@ -271,18 +247,24 @@ def sample_mesh_with_texture_and_priority(
     if isinstance(loaded, trimesh.Scene):
         for default_idx, (name, geom) in enumerate(loaded.geometry.items()):
             if isinstance(geom, trimesh.Trimesh) and len(geom.vertices) > 0 and len(geom.faces) > 0:
+                # ★ GLB内で最初（1番目＝default_idx == 0）に出現するメッシュを除外
+                if default_idx == 0:
+                    print(f"  -> [除外] GLBの先頭（1番目）メッシュをスキップ: {name} (index: {default_idx})")
+                    continue
                 mesh_idx = extract_mesh_index(name, default_idx)
                 transform = loaded.graph.get(name)[0] if name in loaded.graph else np.eye(4)
                 geom_transformed = geom.copy()
                 geom_transformed.apply_transform(transform)
                 indexed_submeshes.append((geom_transformed, mesh_idx, name))
     elif isinstance(loaded, trimesh.Trimesh):
+        # 単一メッシュしかない場合は警告しつつ保持
+        print("  -> [Warning] 単一のTrimeshオブジェクトが読み込まれたため、先頭除外をスキップして処理します。")
         indexed_submeshes.append((loaded, 0, "root"))
     else:
         raise ValueError(f"対応していないメッシュ形式です: {type(loaded)}")
 
     if len(indexed_submeshes) == 0:
-        raise ValueError("有効なメッシュジオメトリが見つかりませんでした。")
+        raise ValueError("有効なメッシュジオメトリが見つかりませんでした（先頭メッシュ除外後の残りが0件です）。")
 
     final_submeshes = []
     for m, m_idx, name in indexed_submeshes:
@@ -300,36 +282,23 @@ def sample_mesh_with_texture_and_priority(
 
     all_points = []
     all_colors = []
-    all_pt_has_tex = []
     all_priorities = []
-    all_mesh_has_tex = []
 
-    tex_submesh_cnt = 0
-    print(f"  -> メッシュモデルのインデックス・テクスチャ解析:")
+    print(f"  -> メッシュモデルのサンプリング:")
     for (mesh, p_idx, name), count in zip(final_submeshes, sub_counts):
         if count <= 0:
             continue
-        
-        is_textured_mesh = mesh_has_texture(mesh)
-        if is_textured_mesh:
-            tex_submesh_cnt += 1
 
         pts, face_indices = trimesh.sample.sample_surface(mesh, count)
-        cols, pt_tex_mask = sample_colors_from_submesh(mesh, pts, face_indices)
-        
-        final_pt_mask = pt_tex_mask if is_textured_mesh else np.zeros(len(pts), dtype=bool)
+        cols, _ = sample_colors_from_submesh(mesh, pts, face_indices)
 
         all_points.append(pts)
         all_colors.append(cols)
-        all_pt_has_tex.append(final_pt_mask)
         all_priorities.append(np.full(len(pts), p_idx, dtype=np.int32))
-        all_mesh_has_tex.append(np.full(len(pts), is_textured_mesh, dtype=bool))
 
     points = np.concatenate(all_points, axis=0).astype(np.float32)
     colors = np.concatenate(all_colors, axis=0).astype(np.float32)
-    pt_has_tex = np.concatenate(all_pt_has_tex, axis=0).astype(bool)
     priorities = np.concatenate(all_priorities, axis=0).astype(np.int32)
-    mesh_has_tex_flags = np.concatenate(all_mesh_has_tex, axis=0).astype(bool)
 
     # 座標系補正 (COLMAP系 OpenCV: Y-Down, Z-Forward vs glTF OpenGL: Y-Up, -Z Forward)
     if rotate_x != 0.0 or rotate_y != 0.0 or rotate_z != 0.0:
@@ -337,11 +306,10 @@ def sample_mesh_with_texture_and_priority(
         print(f"  -> [座標系補正] メッシュ点群に回転補正を適用: X={rotate_x}°, Y={rotate_y}°, Z={rotate_z}°")
 
     unique_priorities = np.unique(priorities)
-    tex_points_cnt = np.sum(pt_has_tex)
     print(f"  -> 検出されたメッシュインデックス一覧: {unique_priorities.tolist()} (最大値: {int(np.max(unique_priorities))} が最前面)")
-    print(f"  -> 点単位サンプリング内訳: 全 {len(points):,} 点中、テクスチャ保持 {tex_points_cnt:,} 点 ({(tex_points_cnt/len(points))*100:.1f}%), なし {len(points)-tex_points_cnt:,} 点")
+    print(f"  -> 点単位サンプリング内訳: 全 {len(points):,} 点を生成")
 
-    return points, colors, pt_has_tex, priorities, mesh_has_tex_flags
+    return points, colors, priorities
 
 
 def convert_mesh_to_gaussian(
@@ -354,18 +322,15 @@ def convert_mesh_to_gaussian(
     rotate_z: float = 0.0,
 ) -> Tuple[VanillaGaussianModel, Dict[int, List[Tuple[VanillaGaussianModel, bool]]], Tuple[np.ndarray, np.ndarray]]:
     """
-    GLBメッシュをガウシアン化し、以下を返す:
+    GLBメッシュ（先頭メッシュ除外済み）をガウシアン化し、以下を返す:
     1. full_gaussian: シーン結合用の全体モデル (ワールド座標をそのまま完全保持)
-    2. render_layers_by_idx: 内部Zバッファ用の {インデックス番号: [(サブガウシアン, is_occluder)]} 辞書
-       ・is_occluder=False: テクスチャあり領域（白で描画）
-       ・is_occluder=True: テクスチャなしメッシュモデル全体（オクルーダーとして黒で遮蔽）
-       ※テクスチャありメッシュ内の余白（テクスチャなし領域）は、is_occluderにせず完全透過（登録しない）
+    2. render_layers_by_idx: 内部Zバッファ用の {インデックス番号: [(サブガウシアン, is_occluder=False)]} 辞書
     3. mesh_bounds: (min_xyz, max_xyz) のバウンディングボックス
     """
     print(f"\n[Step 1] GLBメッシュのガウシアン化を開始: {mesh_path}")
     os.makedirs(os.path.dirname(os.path.abspath(output_gs_path)), exist_ok=True)
 
-    points, colors, pt_has_tex, priorities, mesh_has_tex_flags = sample_mesh_with_texture_and_priority(
+    points, colors, priorities = sample_mesh_with_texture_and_priority(
         mesh_path=mesh_path,
         num_points=num_points,
         rotate_x=rotate_x,
@@ -381,7 +346,7 @@ def convert_mesh_to_gaussian(
     full_gaussian._opacity.data = torch.ones_like(full_gaussian._opacity.data) * 4.595  # ~0.99
     full_gaussian.save_ply(output_gs_path)
 
-    # 内部Zバッファテスト用レイヤーの構築
+    # 内部Zバッファテスト用レイヤーの構築 (オクルーダーは廃止し、すべてマスク描画対象 is_occluder=False とする)
     render_layers_by_idx: Dict[int, List[Tuple[VanillaGaussianModel, bool]]] = {}
     unique_indices = np.unique(priorities)
     
@@ -389,33 +354,17 @@ def convert_mesh_to_gaussian(
         idx_mask = (priorities == idx)
         render_layers_by_idx[idx] = []
 
-        # 1. このインデックス内の「全体としてテクスチャを持たないメッシュ」の点
-        #    -> ★オクルーダーとして機能 (is_occluder = True)
-        non_tex_mesh_mask = idx_mask & (~mesh_has_tex_flags)
-        if np.any(non_tex_mesh_mask):
-            pts_occ = points[non_tex_mesh_mask]
-            cols_occ = colors[non_tex_mesh_mask]
-            pcd_occ = BasicPointCloud(points=pts_occ, colors=cols_occ, normals=None)
-            gs_occ = VanillaGaussianModel(sh_degree=0)
-            gs_occ.create_from_pcd(pcd_occ, spatial_lr_scale=camera_extent)
-            gs_occ._opacity.data = torch.ones_like(gs_occ._opacity.data) * 4.595
-            render_layers_by_idx[idx].append((gs_occ, True))  # is_occluder = True
-
-        # 2. このインデックス内の「テクスチャを持つメッシュ」のうち、「テクスチャが存在する領域の点」
-        #    -> ★マスク描画対象 (is_occluder = False)
-        #    ※「テクスチャが存在するメッシュ内のテクスチャがない領域」はここに含めず完全透過(スルー)！
-        tex_part_mask = idx_mask & mesh_has_tex_flags & pt_has_tex
-        if np.any(tex_part_mask):
-            pts_tex = points[tex_part_mask]
-            cols_tex = colors[tex_part_mask]
-            pcd_tex = BasicPointCloud(points=pts_tex, colors=cols_tex, normals=None)
-            gs_tex = VanillaGaussianModel(sh_degree=0)
-            gs_tex.create_from_pcd(pcd_tex, spatial_lr_scale=camera_extent)
-            gs_tex._opacity.data = torch.ones_like(gs_tex._opacity.data) * 4.595
-            render_layers_by_idx[idx].append((gs_tex, False))  # is_occluder = False
+        pts_layer = points[idx_mask]
+        cols_layer = colors[idx_mask]
+        pcd_layer = BasicPointCloud(points=pts_layer, colors=cols_layer, normals=None)
+        gs_layer = VanillaGaussianModel(sh_degree=0)
+        gs_layer.create_from_pcd(pcd_layer, spatial_lr_scale=camera_extent)
+        gs_layer._opacity.data = torch.ones_like(gs_layer._opacity.data) * 4.595
+        render_layers_by_idx[idx].append((gs_layer, False))  # is_occluder = False
 
     print(f"  -> ガウシアン化完了: {output_gs_path} (インデックスレイヤー数: {len(render_layers_by_idx)})")
     return full_gaussian, render_layers_by_idx, mesh_bounds
+
 
 
 # ==============================================================================
@@ -581,12 +530,8 @@ def render_mesh_silhouette_mask_with_zbuffer(
             # Zバッファの更新
             z_buffer[update_pixels] = rendered_depth[update_pixels]
 
-            if is_occluder:
-                # ★テクスチャなしメッシュモデル全体: 手前の場合は黒(False)で奥の白を遮蔽！
-                mask_buffer[update_pixels] = False
-            else:
-                # ★テクスチャありメッシュのテクスチャ領域: 手前の場合は白(True)で描画！
-                mask_buffer[update_pixels] = True
+            # マスク描画対象として白(True)に設定
+            mask_buffer[update_pixels] = True
 
     mask_np = (mask_buffer.cpu().numpy() * 255).astype(np.uint8)
     mask_image = Image.fromarray(mask_np, mode="L")
