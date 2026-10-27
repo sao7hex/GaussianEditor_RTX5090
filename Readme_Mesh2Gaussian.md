@@ -151,7 +151,6 @@ python Mesh2Gaussian.py --no_refine
 | `--save_mask` | - | `data_dir/output/masks/mask_cam0.png` | 基準カメラの2Dマスク保存先 |
 | `--multiview_mask_dir` | - | `data_dir/output/masks/multiview` | 全カメラ2Dマスク一括保存先フォルダ（デフォルト有効） |
 | `--no_multiview` | - | `False` (全視点マスク生成有効) | 全カメラ視点の2Dマスク一括生成を無効化するフラグ |
-| `--include_first_mesh` | - | `False` (0番目除外) | GLBの先頭（0番目）メッシュも含めてガウシアン化するフラグ |
 | `--no_prune` | - | `False` (自動削除有効) | 重複する不要ガウシアンの自動くり抜きを無効化するフラグ |
 | `--rotate_x` | - | `180.0` | X軸周りの回転補正角度 (度)。COLMAP系とglTF系の食い違いを解消するためデフォルトで180度有効 |
 | `--rotate_y` | - | `0.0` | Y軸周りの回転補正角度 (度) |

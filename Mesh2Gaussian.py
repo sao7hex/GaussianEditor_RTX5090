@@ -235,11 +235,9 @@ def sample_mesh_with_texture_and_priority(
     rotate_x: float = 180.0,
     rotate_y: float = 0.0,
     rotate_z: float = 0.0,
-    include_first_mesh: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    GLBメッシュを読み込み、サンプリングを行う。
-    include_first_mesh=False の場合、先頭（0番目）メッシュを除外する。
+    GLBメッシュを読み込み、0番目のメッシュを除外した上でサンプリングを行う。
     points, colors, priorities を返す。
     デフォルトでCOLMAP座標系とglTF規格の不一致を補正するためX軸180度回転 (rotate_x=180.0) を適用。
     """
@@ -270,13 +268,13 @@ def sample_mesh_with_texture_and_priority(
             if not isinstance(geom, trimesh.Trimesh) or len(geom.vertices) == 0 or len(geom.faces) == 0:
                 continue
 
-            # ★ GLB内で最初（0番目）に出現するメッシュを除外（include_first_mesh=False時）
-            if mesh_count == 0 and not include_first_mesh:
-                print(f"  -> [除外] GLBの先頭（0番目）メッシュをスキップ: ノード={node_name}, ジオメトリ={geom_name}")
+            mesh_idx = extract_mesh_index(node_name, default_idx)
+
+            # ★ 0番目のメッシュ（先頭メッシュ または インデックス0）を常に除外
+            if mesh_count == 0 or mesh_idx == 0:
+                print(f"  -> [除外] 0番目のメッシュをスキップ: ノード={node_name}, ジオメトリ={geom_name} (index: {mesh_idx})")
                 mesh_count += 1
                 continue
-            elif mesh_count == 0 and include_first_mesh:
-                print(f"  -> [保持] GLBの先頭（0番目）メッシュも含めて処理します: ノード={node_name}")
             mesh_count += 1
 
             # 親ノードの取得と階層行列の合成計算 (T_parent_world @ T_child_local)
@@ -293,7 +291,6 @@ def sample_mesh_with_texture_and_priority(
                 # 万が一のフォールバック (単一ノード直接取得)
                 transform = loaded.graph.get(node_name)[0] if node_name in loaded.graph else np.eye(4)
 
-            mesh_idx = extract_mesh_index(node_name, default_idx)
             geom_transformed = geom.copy()
             geom_transformed.apply_transform(transform)
             indexed_submeshes.append((geom_transformed, mesh_idx, node_name))
@@ -305,7 +302,7 @@ def sample_mesh_with_texture_and_priority(
         raise ValueError(f"対応していないメッシュ形式です: {type(loaded)}")
 
     if len(indexed_submeshes) == 0:
-        raise ValueError("有効なメッシュジオメトリが見つかりませんでした（先頭メッシュ除外後の残りが0件です）。")
+        raise ValueError("有効なメッシュジオメトリが見つかりませんでした（0番目メッシュ除外後の残りが0件です）。")
 
     final_submeshes = []
     for m, m_idx, name in indexed_submeshes:
@@ -361,15 +358,14 @@ def convert_mesh_to_gaussian(
     rotate_x: float = 180.0,
     rotate_y: float = 0.0,
     rotate_z: float = 0.0,
-    include_first_mesh: bool = False,
 ) -> Tuple[VanillaGaussianModel, Dict[int, List[Tuple[VanillaGaussianModel, bool]]], Tuple[np.ndarray, np.ndarray]]:
     """
-    GLBメッシュをガウシアン化し、以下を返す:
+    GLBメッシュ（0番目メッシュ除外済み）をガウシアン化し、以下を返す:
     1. full_gaussian: シーン結合用の全体モデル (ワールド座標をそのまま完全保持)
     2. render_layers_by_idx: 内部Zバッファ用の {インデックス番号: [(サブガウシアン, is_occluder=False)]} 辞書
     3. mesh_bounds: (min_xyz, max_xyz) のバウンディングボックス
     """
-    print(f"\n[Step 1] GLBメッシュのガウシアン化を開始: {mesh_path} (0番目メッシュ含む: {include_first_mesh})")
+    print(f"\n[Step 1] GLBメッシュのガウシアン化を開始: {mesh_path} (0番目メッシュ除外)")
     os.makedirs(os.path.dirname(os.path.abspath(output_gs_path)), exist_ok=True)
 
     points, colors, priorities = sample_mesh_with_texture_and_priority(
@@ -378,8 +374,8 @@ def convert_mesh_to_gaussian(
         rotate_x=rotate_x,
         rotate_y=rotate_y,
         rotate_z=rotate_z,
-        include_first_mesh=include_first_mesh,
     )
+
     mesh_bounds = (points.min(axis=0), points.max(axis=0))
 
     # 全体モデルの初期化 (座標は一切変換しない)
@@ -905,13 +901,6 @@ def main():
     parser.add_argument("--num_points", "-n", type=int, default=200000, help="サンプリングするガウシアン点数 (デフォルト: 200,000)")
     parser.add_argument("--cam_id", type=int, default=0, help="2Dマスクをレンダリング保存する基準カメラのID (デフォルト: 0)")
     parser.add_argument("--depth_tolerance", type=float, default=0.005, help="同一平面判定トレランス (Z-fighting解消用, デフォルト: 0.005)")
-    parser.add_argument(
-        "--include_first_mesh", "--include-first-mesh", "-f",
-        dest="include_first_mesh",
-        action="store_true",
-        default=False,
-        help="GLBの先頭（0番目）メッシュも含めてガウシアン化する（デフォルトは0番目を除外）"
-    )
 
     # 座標系補正 (COLMAP系/glTF系の不一致を解消するため、デフォルトでX軸180度回転が有効)
     parser.add_argument("--rotate_x", "--rotate-x", type=float, default=180.0, help="メッシュに適用するX軸回転角度(度)。デフォルト: 180.0 (COLMAP/OpenGL軸補正)")
@@ -1012,7 +1001,7 @@ def main():
     print(f"  ・出力PLYファイル    : {output_ply}")
     print(f"  ・単一2Dマスク保存先 : {save_mask}")
     print(f"  ・全カメラマスク保存 : {'有効 (フォルダ: ' + multiview_mask_dir + ')' if multiview_enabled else '無効'}")
-    print(f"  ・先頭メッシュ(0番目): {'含む (--include_first_mesh)' if args.include_first_mesh else '除外 (デフォルト)'}")
+    print(f"  ・先頭メッシュ(0番目): 除外")
     print(f"  ・不要点群自動削除   : {'有効' if auto_prune_enabled else '無効'}")
     print(f"  ・拡散モデルRefine   : {'有効 (Steps: ' + str(args.refine_steps) + ')' if refine_enabled else '無効'}")
     print("=" * 70)
@@ -1030,7 +1019,6 @@ def main():
         rotate_x=rot_x,
         rotate_y=rot_y,
         rotate_z=rot_z,
-        include_first_mesh=args.include_first_mesh,
     )
 
     # --------------------------------------------------------------------------
