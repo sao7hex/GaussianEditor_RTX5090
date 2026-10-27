@@ -256,14 +256,15 @@ def apply_euler_rotation(points: np.ndarray, rx_deg: float, ry_deg: float, rz_de
 def sample_mesh_with_texture_and_priority(
     mesh_path: str,
     num_points: int = 200000,
-    rotate_x: float = -90.0,
+    rotate_x: float = 0.0,
     rotate_y: float = 0.0,
     rotate_z: float = 0.0,
+    apply_node_transform: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     GLBメッシュを読み込み、各サブメッシュのインデックス番号とテクスチャ属性を抽出。
     points, colors, pt_has_tex, priorities, mesh_has_tex_flag を返す。
-    デフォルトでBlender座標系(Z-Up)とCOLMAP/3DGS規格(Y-Down)の整合のため原点中心のX軸-90度回転 (rotate_x=-90.0) を適用。
+    デフォルトでは回転補正およびノードのトランスフォーム適用を行わず、メッシュの生頂点座標をそのまま使用。
     """
     loaded = trimesh.load(mesh_path, process=False)
 
@@ -272,9 +273,10 @@ def sample_mesh_with_texture_and_priority(
         for default_idx, (name, geom) in enumerate(loaded.geometry.items()):
             if isinstance(geom, trimesh.Trimesh) and len(geom.vertices) > 0 and len(geom.faces) > 0:
                 mesh_idx = extract_mesh_index(name, default_idx)
-                transform = loaded.graph.get(name)[0] if name in loaded.graph else np.eye(4)
                 geom_transformed = geom.copy()
-                geom_transformed.apply_transform(transform)
+                if apply_node_transform and name in loaded.graph:
+                    transform = loaded.graph.get(name)[0]
+                    geom_transformed.apply_transform(transform)
                 indexed_submeshes.append((geom_transformed, mesh_idx, name))
     elif isinstance(loaded, trimesh.Trimesh):
         indexed_submeshes.append((loaded, 0, "root"))
@@ -331,10 +333,12 @@ def sample_mesh_with_texture_and_priority(
     priorities = np.concatenate(all_priorities, axis=0).astype(np.int32)
     mesh_has_tex_flags = np.concatenate(all_mesh_has_tex, axis=0).astype(bool)
 
-    # 座標系補正 (Blender Z-Up系 から 3DGS/COLMAP Y-Down系 への回転補正: デフォルト原点中心のX軸 -90度回転)
+    # 座標系補正 (回転角度が指定されている場合のみ適用)
     if rotate_x != 0.0 or rotate_y != 0.0 or rotate_z != 0.0:
         points = apply_euler_rotation(points, rotate_x, rotate_y, rotate_z)
         print(f"  -> [座標系補正] メッシュ点群に回転補正を適用 (原点中心): X={rotate_x}°, Y={rotate_y}°, Z={rotate_z}°")
+    else:
+        print(f"  -> [座標系補正] 回転補正なし (0.0°)")
 
     unique_priorities = np.unique(priorities)
     tex_points_cnt = np.sum(pt_has_tex)
@@ -349,9 +353,10 @@ def convert_mesh_to_gaussian(
     output_gs_path: str,
     num_points: int = 200000,
     camera_extent: float = 1.0,
-    rotate_x: float = -90.0,
+    rotate_x: float = 0.0,
     rotate_y: float = 0.0,
     rotate_z: float = 0.0,
+    apply_node_transform: bool = False,
 ) -> Tuple[VanillaGaussianModel, Dict[int, List[Tuple[VanillaGaussianModel, bool]]], Tuple[np.ndarray, np.ndarray]]:
     """
     GLBメッシュをガウシアン化し、以下を返す:
@@ -371,6 +376,7 @@ def convert_mesh_to_gaussian(
         rotate_x=rotate_x,
         rotate_y=rotate_y,
         rotate_z=rotate_z,
+        apply_node_transform=apply_node_transform,
     )
     mesh_bounds = (points.min(axis=0), points.max(axis=0))
 
@@ -918,11 +924,11 @@ def main():
     parser.add_argument("--cam_id", type=int, default=0, help="2Dマスクをレンダリング保存する基準カメラのID (デフォルト: 0)")
     parser.add_argument("--depth_tolerance", type=float, default=0.005, help="同一平面判定トレランス (Z-fighting解消用, デフォルト: 0.005)")
 
-    # 座標系補正 (Blender Z-Up規格 から COLMAP/3DGS Y-Down規格 への変換: デフォルトX軸 -90度回転)
-    parser.add_argument("--rotate_x", type=float, default=-90.0, help="メッシュに適用するX軸回転角度(度)。デフォルト: -90.0 (Blender/COLMAP軸補正)")
+    # 座標系補正 (デフォルト: 回転補正なし 0.0度)
+    parser.add_argument("--rotate_x", type=float, default=0.0, help="メッシュに適用するX軸回転角度(度)。デフォルト: 0.0")
     parser.add_argument("--rotate_y", type=float, default=0.0, help="メッシュに適用するY軸回転角度(度)。デフォルト: 0.0")
     parser.add_argument("--rotate_z", type=float, default=0.0, help="メッシュに適用するZ軸回転角度(度)。デフォルト: 0.0")
-    parser.add_argument("--no_rotate_x", action="store_true", default=False, help="X軸回転補正を無効化する (回転角度を0.0にする)")
+    parser.add_argument("--apply_node_transform", action="store_true", default=False, help="GLBノードの配置行列(トランスフォーム)を適用する (デフォルト: 無効)")
 
     # 自動処理フラグ (デフォルトで True。スキップしたい場合のみ --no_* を指定)
     parser.add_argument("--no_prune", action="store_true", default=False, help="不要な重複点群の自動削除を無効化する")
@@ -1000,8 +1006,8 @@ def main():
     multiview_enabled = not args.no_multiview
     multiview_mask_dir = args.multiview_mask_dir if args.multiview_mask_dir else os.path.join(output_masks_dir, "multiview")
 
-    # 座標系補正 (デフォルトでX軸-90度回転が有効)
-    rot_x = 0.0 if args.no_rotate_x else args.rotate_x
+    # 座標系補正
+    rot_x = args.rotate_x
     rot_y = args.rotate_y
     rot_z = args.rotate_z
 
@@ -1011,7 +1017,8 @@ def main():
     print(f"  ・3Dメッシュ入力     : {mesh_path}")
     print(f"  ・Colmapデータセット : {source_path}")
     print(f"  ・3DGSモデル入力     : {model_path}")
-    print(f"  ・座標系回転補正     : X={rot_x}°, Y={rot_y}°, Z={rot_z}° {'(Blender/3DGS軸補正有効)' if rot_x != 0.0 else '(無効)'}")
+    print(f"  ・GLBトランスフォーム: {'有効 (ノード行列を適用)' if args.apply_node_transform else '無効 (生頂点座標をそのまま使用)'}")
+    print(f"  ・座標系回転補正     : {'X=' + str(rot_x) + '°, Y=' + str(rot_y) + '°, Z=' + str(rot_z) + '°' if (rot_x != 0.0 or rot_y != 0.0 or rot_z != 0.0) else 'なし (0.0°)'}")
     print(f"  ・出力PLYファイル    : {output_ply}")
     print(f"  ・単一2Dマスク保存先 : {save_mask}")
     print(f"  ・全カメラマスク保存 : {'有効 (フォルダ: ' + multiview_mask_dir + ')' if multiview_enabled else '無効'}")
@@ -1032,6 +1039,7 @@ def main():
         rotate_x=rot_x,
         rotate_y=rot_y,
         rotate_z=rot_z,
+        apply_node_transform=args.apply_node_transform,
     )
 
     # --------------------------------------------------------------------------
