@@ -238,7 +238,7 @@ def sample_mesh_with_texture_and_priority(
     mesh_log_path: Optional[str] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    GLBメッシュを読み込み、0番目のメッシュを除外した上でサンプリングを行う。
+    GLBメッシュを読み込み、一番最後のメッシュを除外した上でサンプリングを行う。
     points, colors, priorities を返す。
     デフォルトでは回転補正なし (rotate_x=0.0)。必要に応じてオイラー角を適用可能。
     mesh_log_path が指定されている場合、メッシュ一覧とサンプリング結果をログファイルに保存する。
@@ -264,7 +264,6 @@ def sample_mesh_with_texture_and_priority(
         base_frame = loaded.graph.base_frame
 
         # シーングラフのノードを走査し、親ノードからの累積変換行列を正確に計算
-        mesh_count = 0
         nodes_with_mesh = []
         for default_idx, node_name in enumerate(loaded.graph.nodes):
             geom_name = loaded.graph.transforms.node_data.get(node_name, {}).get("geometry", None)
@@ -278,23 +277,28 @@ def sample_mesh_with_texture_and_priority(
             for default_idx, (name, _) in enumerate(loaded.geometry.items()):
                 nodes_with_mesh.append((default_idx, name, name))
 
-        log(f"  -> GLB内の全メッシュ検出・解析 (全 {len(nodes_with_mesh)} 個):")
+        # 空でない有効なメッシュジオメトリを抽出
+        valid_mesh_nodes = []
         for default_idx, node_name, geom_name in nodes_with_mesh:
             geom = loaded.geometry[geom_name]
-            if not isinstance(geom, trimesh.Trimesh) or len(geom.vertices) == 0 or len(geom.faces) == 0:
+            if isinstance(geom, trimesh.Trimesh) and len(geom.vertices) > 0 and len(geom.faces) > 0:
+                valid_mesh_nodes.append((default_idx, node_name, geom_name))
+            else:
                 log(f"     [スキップ] 空のジオメトリ: ノード='{node_name}'")
-                continue
 
+        total_valid = len(valid_mesh_nodes)
+        log(f"  -> GLB内の全メッシュ検出・解析 (有効メッシュ数: {total_valid} 個):")
+
+        for mesh_count, (default_idx, node_name, geom_name) in enumerate(valid_mesh_nodes):
+            geom = loaded.geometry[geom_name]
             mesh_idx = extract_mesh_index(node_name, default_idx)
 
-            # ★ GLB内で最初（0番目＝mesh_count == 0）に出現するメッシュのみを除外！
-            if mesh_count == 0:
-                log(f"     [除外] ★ 0番目（先頭）メッシュをスキップ: ノード='{node_name}', ジオメトリ='{geom_name}' (頂点数: {len(geom.vertices):,})")
-                mesh_count += 1
+            # ★ GLB内で一番最後（末尾 = mesh_count == total_valid - 1）に出現するメッシュを除外！
+            if total_valid > 1 and mesh_count == total_valid - 1:
+                log(f"     [除外] ★ 最後のメッシュ（#{mesh_count}）をスキップ: ノード='{node_name}', ジオメトリ='{geom_name}' (頂点数: {len(geom.vertices):,})")
                 continue
 
             log(f"     [採用] メッシュ #{mesh_count}: ノード='{node_name}', ジオメトリ='{geom_name}' (Index: {mesh_idx}, 頂点数: {len(geom.vertices):,})")
-            mesh_count += 1
 
             # 親ノードの取得と階層行列の合成計算 (T_parent_world @ T_child_local)
             parent_node = parents_map.get(node_name, base_frame)
@@ -314,13 +318,13 @@ def sample_mesh_with_texture_and_priority(
             indexed_submeshes.append((geom_transformed, mesh_idx, node_name))
     elif isinstance(loaded, trimesh.Trimesh):
         # 単一メッシュしかない場合は警告しつつ保持
-        log("  -> [Warning] 単一のTrimeshオブジェクトが読み込まれたため、先頭除外をスキップして処理します。")
+        log("  -> [Warning] 単一のTrimeshオブジェクトが読み込まれたため、末尾除外をスキップして処理します。")
         indexed_submeshes.append((loaded, 0, "root"))
     else:
         raise ValueError(f"対応していないメッシュ形式です: {type(loaded)}")
 
     if len(indexed_submeshes) == 0:
-        raise ValueError("有効なメッシュジオメトリが見つかりませんでした（0番目メッシュ除外後の残りが0件です）。")
+        raise ValueError("有効なメッシュジオメトリが見つかりませんでした（末尾メッシュ除外後の残りが0件です）。")
 
     final_submeshes = []
     for m, m_idx, name in indexed_submeshes:
@@ -393,12 +397,12 @@ def convert_mesh_to_gaussian(
     mesh_log_path: Optional[str] = None,
 ) -> Tuple[VanillaGaussianModel, Dict[int, List[Tuple[VanillaGaussianModel, bool]]], Tuple[np.ndarray, np.ndarray]]:
     """
-    GLBメッシュ（0番目メッシュ除外済み）をガウシアン化し、以下を返す:
+    GLBメッシュ（一番最後のメッシュ除外済み）をガウシアン化し、以下を返す:
     1. full_gaussian: シーン結合用の全体モデル (ワールド座標をそのまま完全保持)
     2. render_layers_by_idx: 内部Zバッファ用の {インデックス番号: [(サブガウシアン, is_occluder=False)]} 辞書
     3. mesh_bounds: (min_xyz, max_xyz) のバウンディングボックス
     """
-    print(f"\n[Step 1] GLBメッシュのガウシアン化を開始: {mesh_path} (0番目メッシュ除外)")
+    print(f"\n[Step 1] GLBメッシュのガウシアン化を開始: {mesh_path} (一番最後のメッシュを除外)")
     os.makedirs(os.path.dirname(os.path.abspath(output_gs_path)), exist_ok=True)
 
     # ログ出力先が指定されていない場合は output_gs_path と同階層の logs/mesh_log.txt に設定
@@ -1043,7 +1047,7 @@ def main():
     print(f"  ・単一2Dマスク保存先 : {save_mask}")
     print(f"  ・全カメラマスク保存 : {'有効 (フォルダ: ' + multiview_mask_dir + ')' if multiview_enabled else '無効'}")
     print(f"  ・メッシュ解析ログ   : {mesh_log_path}")
-    print(f"  ・先頭メッシュ(0番目): 除外")
+    print(f"  ・除外対象メッシュ   : 一番最後のメッシュ (末尾)")
     print(f"  ・不要点群自動削除   : {'有効' if auto_prune_enabled else '無効'}")
     print(f"  ・拡散モデルRefine   : {'有効 (Steps: ' + str(args.refine_steps) + ')' if refine_enabled else '無効'}")
     print("=" * 70)
