@@ -275,8 +275,17 @@ def sample_mesh_with_texture_and_priority(
                 mesh_idx = extract_mesh_index(name, default_idx)
                 geom_transformed = geom.copy()
                 if apply_node_transform and name in loaded.graph:
-                    transform = loaded.graph.get(name)[0]
+                    # ルートからの累積ワールド変換行列を取得
+                    transform_node = loaded.graph.get(name)
+                    transform = transform_node[0] if isinstance(transform_node, tuple) else transform_node
                     geom_transformed.apply_transform(transform)
+
+                v = geom_transformed.vertices
+                print(f"  -> [Mesh解析] {name}: 頂点数={len(v):,}, "
+                      f"X=[{v[:,0].min():.3f}, {v[:,0].max():.3f}], "
+                      f"Y=[{v[:,1].min():.3f}, {v[:,1].max():.3f}], "
+                      f"Z=[{v[:,2].min():.3f}, {v[:,2].max():.3f}]")
+
                 indexed_submeshes.append((geom_transformed, mesh_idx, name))
     elif isinstance(loaded, trimesh.Trimesh):
         indexed_submeshes.append((loaded, 0, "root"))
@@ -332,6 +341,12 @@ def sample_mesh_with_texture_and_priority(
     pt_has_tex = np.concatenate(all_pt_has_tex, axis=0).astype(bool)
     priorities = np.concatenate(all_priorities, axis=0).astype(np.int32)
     mesh_has_tex_flags = np.concatenate(all_mesh_has_tex, axis=0).astype(bool)
+
+    print(f"  -> [点群座標範囲 (サンプリング直後)]:")
+    print(f"     X: [{points[:, 0].min():.3f}, {points[:, 0].max():.3f}]")
+    print(f"     Y: [{points[:, 1].min():.3f}, {points[:, 1].max():.3f}]")
+    print(f"     Z: [{points[:, 2].min():.3f}, {points[:, 2].max():.3f}]")
+    print(f"     中心 (重心): {points.mean(axis=0).round(3).tolist()}")
 
     # 座標系補正 (回転角度が指定されている場合のみ適用)
     if rotate_x != 0.0 or rotate_y != 0.0 or rotate_z != 0.0:
