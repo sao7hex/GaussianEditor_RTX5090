@@ -357,11 +357,26 @@ def sample_mesh_with_texture_and_priority(
         log(f"     ・ノード='{name}' (優先度Index: {p_idx}, 表面積: {mesh.area:.5f}): {count:,} 点をサンプリング")
 
         pts, face_indices = trimesh.sample.sample_surface(mesh, count)
-        cols, _ = sample_colors_from_submesh(mesh, pts, face_indices)
+        cols, has_tex_mask = sample_colors_from_submesh(mesh, pts, face_indices)
 
-        all_points.append(pts)
-        all_colors.append(cols)
-        all_priorities.append(np.full(len(pts), p_idx, dtype=np.int32))
+        # テクスチャが存在しない点（テクスチャなしメッシュ、UV未展開面、透過領域など）にはガウシアンを生成しない
+        if not np.any(has_tex_mask):
+            log(f"     [スキップ] テクスチャが存在しないためガウシアン生成を除外: ノード='{name}'")
+            continue
+
+        valid_pts = pts[has_tex_mask]
+        valid_cols = cols[has_tex_mask]
+        valid_priorities = np.full(len(valid_pts), p_idx, dtype=np.int32)
+
+        if len(valid_pts) < count:
+            log(f"     [テクスチャフィルタ] 非テクスチャ/透明領域 {count - len(valid_pts):,} 点を除外 -> 有効な {len(valid_pts):,} 点のみガウシアン化")
+
+        all_points.append(valid_pts)
+        all_colors.append(valid_cols)
+        all_priorities.append(valid_priorities)
+
+    if len(all_points) == 0:
+        raise ValueError("テクスチャを持つ有効な点群が見つかりませんでした（すべての点にテクスチャが存在しないか透明です）。")
 
     points = np.concatenate(all_points, axis=0).astype(np.float32)
     colors = np.concatenate(all_colors, axis=0).astype(np.float32)
