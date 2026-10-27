@@ -869,25 +869,33 @@ def main():
     parser.add_argument("--num_points", "-n", type=int, default=200000, help="サンプリングするガウシアン点数 (デフォルト: 200,000)")
     parser.add_argument("--cam_id", type=int, default=0, help="2Dマスクをレンダリング保存する基準カメラのID (デフォルト: 0)")
     parser.add_argument("--depth_tolerance", type=float, default=0.005, help="同一平面判定トレランス (Z-fighting解消用, デフォルト: 0.005)")
-    parser.add_argument("--include_first_mesh", action="store_true", default=False, help="GLBの先頭（0番目）メッシュも含めてガウシアン化する（デフォルトは0番目を除外）")
+    parser.add_argument(
+        "--include_first_mesh", "--include-first-mesh", "-f",
+        dest="include_first_mesh",
+        action="store_true",
+        default=False,
+        help="GLBの先頭（0番目）メッシュも含めてガウシアン化する（デフォルトは0番目を除外）"
+    )
 
     # 座標系補正 (COLMAP系/glTF系の不一致を解消するため、デフォルトでX軸180度回転が有効)
-    parser.add_argument("--rotate_x", type=float, default=180.0, help="メッシュに適用するX軸回転角度(度)。デフォルト: 180.0 (COLMAP/OpenGL軸補正)")
-    parser.add_argument("--rotate_y", type=float, default=0.0, help="メッシュに適用するY軸回転角度(度)。デフォルト: 0.0")
-    parser.add_argument("--rotate_z", type=float, default=0.0, help="メッシュに適用するZ軸回転角度(度)。デフォルト: 0.0")
-    parser.add_argument("--no_rotate_x", action="store_true", default=False, help="X軸180度回転補正を無効化する (デフォルトは補正有効)")
+    parser.add_argument("--rotate_x", "--rotate-x", type=float, default=180.0, help="メッシュに適用するX軸回転角度(度)。デフォルト: 180.0 (COLMAP/OpenGL軸補正)")
+    parser.add_argument("--rotate_y", "--rotate-y", type=float, default=0.0, help="メッシュに適用するY軸回転角度(度)。デフォルト: 0.0")
+    parser.add_argument("--rotate_z", "--rotate-z", type=float, default=0.0, help="メッシュに適用するZ軸回転角度(度)。デフォルト: 0.0")
+    parser.add_argument("--no_rotate_x", "--no-rotate-x", action="store_true", default=False, help="X軸180度回転補正を無効化する (デフォルトは補正有効)")
 
     # 自動処理フラグ (デフォルトで True。スキップしたい場合のみ --no_* を指定)
-    parser.add_argument("--no_prune", action="store_true", default=False, help="不要な重複点群の自動削除を無効化する")
-    parser.add_argument("--prune_margin", type=float, default=0.02, help="重複点判定時のバウンディングボックス／深度マージン (デフォルト: 0.02)")
+    parser.add_argument("--no_prune", "--no-prune", action="store_true", default=False, help="不要な重複点群の自動削除を無効化する")
+    parser.add_argument("--prune_margin", "--prune-margin", type=float, default=0.02, help="重複点判定時のバウンディングボックス／深度マージン (デフォルト: 0.02)")
 
-    parser.add_argument("--no_refine", action="store_true", default=False, help="拡散モデルによる境界ブレンディングを無効化する")
+    parser.add_argument("--no_refine", "--no-refine", action="store_true", default=False, help="拡散モデルによる境界ブレンディングを無効化する")
     parser.add_argument("--prompt", type=str, default="a photorealistic seamless integration, extremely detailed", help="境界ブレンディング用プロンプト")
-    parser.add_argument("--refine_steps", type=int, default=200, help="境界ブレンディングの最適化ステップ数 (デフォルト: 200)")
-    parser.add_argument("--per_editing_step", type=int, default=10, help="拡散モデルによる目標画像更新インターバル (デフォルト: 10)")
+    parser.add_argument("--refine_steps", "--refine-steps", type=int, default=200, help="境界ブレンディングの最適化ステップ数 (デフォルト: 200)")
+    parser.add_argument("--per_editing_step", "--per-editing-step", type=int, default=10, help="拡散モデルによる目標画像更新インターバル (デフォルト: 10)")
     parser.add_argument("--lr", type=float, default=0.005, help="ファインチューニングの学習率 (デフォルト: 0.005)")
 
-    args = parser.parse_args()
+    args, unknown = parser.parse_known_args()
+    if unknown:
+        print(f"[*] 注意: 未知の引数は無視されました: {unknown}")
 
     # --------------------------------------------------------------------------
     # 0. Mesh2Gaussian_data フォルダ構造の自動準備 ＆ パス自動解決
