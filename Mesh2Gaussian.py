@@ -1230,7 +1230,9 @@ def refine_with_diffusion(
     ip2p = InstructPix2PixGuidance(
         OmegaConf.create({
             "min_step_percent": 0.02,
-            "max_step_percent": 0.98,
+            "max_step_percent": 0.45,
+            "guidance_scale": 5.5,
+            "condition_scale": 2.5,
         })
     )
 
@@ -1408,7 +1410,7 @@ def main():
     parser.add_argument("--prune_margin", "--prune-margin", type=float, default=0.02, help="重複点判定時のバウンディングボックス／深度マージン (デフォルト: 0.02)")
 
     parser.add_argument("--no_refine", "--no-refine", action="store_true", default=False, help="拡散モデルによる境界ブレンディングを無効化する")
-    parser.add_argument("--prompt", type=str, default="a photorealistic seamless integration, extremely detailed", help="境界ブレンディング用プロンプト")
+    parser.add_argument("--prompt", type=str, default="smoothly blend the edges into the surface and fill in the gaps seamlessly", help="境界ブレンディング用プロンプト")
     parser.add_argument("--refine_steps", "--refine-steps", type=int, default=200, help="境界ブレンディングの最適化ステップ数 (デフォルト: 200)")
     parser.add_argument("--per_editing_step", "--per-editing-step", type=int, default=10, help="拡散モデルによる目標画像更新インターバル (デフォルト: 10)")
     parser.add_argument("--lr", type=float, default=0.005, help="ファインチューニングの学習率 (デフォルト: 0.005)")
