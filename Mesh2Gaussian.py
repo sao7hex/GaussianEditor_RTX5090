@@ -694,8 +694,9 @@ def load_base_scene(
         anchor_weight_init=0.1,
         anchor_weight_multiplier=2.0,
     )
-    # direct_ply_file がある場合は Scene による自動PLY探索を抑制
-    scene_load_iter = None if direct_ply_file else iteration
+    # direct_ply_file がある場合、または model_params_path 直下に point_cloud/ フォルダがない場合は Scene による自動PLY探索を抑制
+    has_point_cloud_dir = os.path.exists(os.path.join(model_params_path, "point_cloud"))
+    scene_load_iter = iteration if (not direct_ply_file and has_point_cloud_dir) else None
 
     scene = Scene(
         args=model_params,
@@ -1075,10 +1076,15 @@ def refine_with_diffusion(
     per_editing_step: int = 10,
     lr: float = 0.005,
     output_dir: str = "Mesh2Gaussian_data/output",
+    boundary_dist_thresh: float = 0.05,
+    densification_interval: int = 20,
+    max_grad: float = 1e-4,
+    max_densify_percent: float = 0.01,
+    min_opacity: float = 0.005,
 ):
     """
     GaussianEditor の InstructPix2Pix / EditGuidance を直接呼び出し、
-    結合後のシーンの境界部分を拡散モデルで最適化・ブレンディングする。
+    結合後のシーンの境界部分を拡散モデルで最適化（色・位置・スケール・回転・不透明度の調整および分割・複製・除去）する。
     """
     print(f"\n[Step 5: Refine] 拡散モデルによるテクスチャ＆境界ブレンディングを開始...")
     print(f"  -> プロンプト: '{prompt}', 最適化ステップ数: {refine_steps}")
@@ -1091,16 +1097,36 @@ def refine_with_diffusion(
     from threestudio.models.guidance.instructpix2pix_guidance import InstructPix2PixGuidance
     from gaussiansplatting.arguments import OptimizationParams
 
-    # 1. オプティマイザの初期化 (色のファインチューニング)
+    # 1. オプティマイザの初期化 (色だけでなく、位置・スケール・回転・不透明度の学習も有効化)
     opt = OptimizationParams(argparse.ArgumentParser(), max_steps=refine_steps)
-    opt.position_lr_init = 0.0
-    opt.position_lr_final = 0.0
-    opt.scaling_lr = 0.0
-    opt.rotation_lr = 0.0
-    opt.opacity_lr = 0.0
+    opt.position_lr_init = 0.00016
+    opt.position_lr_final = 0.0000016
+    opt.scaling_lr = 0.005
+    opt.rotation_lr = 0.001
+    opt.opacity_lr = 0.05
     opt.feature_lr = lr
+    opt.percent_dense = 0.01
+
+    if hasattr(scene, "cameras_extent") and scene.cameras_extent > 0:
+        gaussian.spatial_lr_scale = scene.cameras_extent
 
     gaussian.training_setup(opt)
+
+    # デカール周辺の既存境界ガウシアンもマスク (gaussian.mask = True) に含め、分割・複製・除去・移動を許可する
+    with torch.no_grad():
+        decal_mask = gaussian.mask.detach().clone().squeeze()
+        if decal_mask.any() and (~decal_mask).any() and boundary_dist_thresh > 0:
+            near_bg_mask = gaussian.get_near_gaussians_by_mask(
+                decal_mask, dist_thresh=boundary_dist_thresh
+            )
+            expanded_mask = decal_mask.clone()
+            expanded_mask[~decal_mask] = near_bg_mask
+            if hasattr(gaussian, "hooks"):
+                gaussian.remove_grad_mask()
+            gaussian.apply_grad_mask(expanded_mask)
+            gaussian.update_anchor()
+            gaussian.anchor_postfix()
+            print(f"  -> 境界周辺の既存ガウシアン {int(near_bg_mask.sum().item()):,} 点を更新・分割・除去対象マスクに追加しました")
 
     # 2. 拡散モデルとプロンプトプロセッサの初期化
     print("  -> InstructPix2Pix ガイダンスモデルを読み込み中...")
@@ -1144,9 +1170,11 @@ def refine_with_diffusion(
     print(f"  -> 全 {len(train_cams)} 視点の初期レンダリング画像を保存しました: {origin_render_dir}")
 
     edit_frames = {}
+    densify_until_iter = max(refine_steps - 10, 1)
+    cameras_extent = getattr(scene, "cameras_extent", 1.0)
 
-    # 4. 最適化ループ
-    print(f"  -> 最適化ループを実行中 (0 ~ {refine_steps} steps)...")
+    # 4. 最適化ループ (色・位置・スケール・回転・不透明度の最適化 ＋ ガウシアンの分割・複製・除去)
+    print(f"  -> 最適化ループを実行中 (0 ~ {refine_steps} steps, 分割・除去間隔: {densification_interval} steps)...")
     pbar = trange(refine_steps, desc="Refining Gaussian Splatting")
     for step in pbar:
         gaussian.update_learning_rate(step)
@@ -1155,6 +1183,9 @@ def refine_with_diffusion(
 
         render_pkg = render(cam, gaussian, pipe, bg_color)
         image = render_pkg["render"]
+        viewspace_point_tensor = render_pkg["viewspace_points"]
+        visibility_filter = render_pkg["visibility_filter"]
+        radii = render_pkg["radii"]
 
         # InstructPix2Pix で目標画像を生成
         if cam_idx not in edit_frames or (step % per_editing_step == 0):
@@ -1182,14 +1213,42 @@ def refine_with_diffusion(
         # アンカーロス（幾何形状・スケールの安定化）
         if hasattr(gaussian, "anchor_loss"):
             anchor_out = gaussian.anchor_loss()
-            loss += 5.0 * anchor_out.get('loss_anchor_geo', 0.0) + 5.0 * anchor_out.get('loss_anchor_scale', 0.0)
+            loss += (
+                5.0 * anchor_out.get("loss_anchor_color", 0.0)
+                + 50.0 * anchor_out.get("loss_anchor_geo", 0.0)
+                + 50.0 * anchor_out.get("loss_anchor_opacity", 0.0)
+                + 50.0 * anchor_out.get("loss_anchor_scale", 0.0)
+            )
 
         loss.backward()
+
+        # 2Dスクリーン空間の勾配統計を蓄積 (分割・複製・除去用)
+        with torch.no_grad():
+            if step < densify_until_iter and viewspace_point_tensor.grad is not None:
+                gaussian.max_radii2D[visibility_filter] = torch.max(
+                    gaussian.max_radii2D[visibility_filter],
+                    radii[visibility_filter],
+                )
+                gaussian.add_densification_stats(
+                    viewspace_point_tensor.grad, visibility_filter
+                )
+
         gaussian.optimizer.step()
         gaussian.optimizer.zero_grad(set_to_none=True)
 
+        # 一定ステップごとにガウシアンの分割 (split) / 複製 (clone) / 除去 (prune) を実行
+        with torch.no_grad():
+            if step > 0 and step < densify_until_iter and (step % densification_interval == 0):
+                gaussian.densify_and_prune(
+                    max_grad=max_grad,
+                    max_densify_percent=max_densify_percent,
+                    min_opacity=min_opacity,
+                    extent=cameras_extent,
+                    max_screen_size=5,
+                )
+
         if step % 10 == 0:
-            pbar.set_postfix({"L1": f"{loss_l1.item():.4f}", "Loss": f"{loss.item():.4f}"})
+            pbar.set_postfix({"L1": f"{loss_l1.item():.4f}", "Loss": f"{loss.item():.4f}", "Pts": f"{gaussian.get_xyz.shape[0]:,}"})
 
     print(f"  -> 拡散モデルによる境界ブレンディングが完了しました！")
 
