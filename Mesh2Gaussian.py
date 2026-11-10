@@ -459,6 +459,7 @@ def sample_mesh_with_texture_and_priority(
     all_points = []
     all_colors = []
     all_priorities = []
+    all_normals = []
 
     log(f"\n  -> 各メッシュへの有効点数割り当て結果 (有効目標合計: {num_points:,} 点, 均一グリッドサンプリング):")
     for (mesh, p_idx, name, v_ratio, eff_area), target_valid_count in zip(valid_submeshes_info, sub_counts):
@@ -478,6 +479,8 @@ def sample_mesh_with_texture_and_priority(
         valid_pts = pts[has_tex_mask]
         valid_cols = cols[has_tex_mask]
         valid_priorities = np.full(len(valid_pts), p_idx, dtype=np.int32)
+        face_norms = np.asarray(mesh.face_normals, dtype=np.float32)
+        valid_normals = face_norms[face_indices[has_tex_mask]]
 
         log(
             f"     ・ノード='{name}' (Index: {p_idx}, 有効面積比: {v_ratio*100:.1f}%): "
@@ -487,6 +490,7 @@ def sample_mesh_with_texture_and_priority(
         all_points.append(valid_pts)
         all_colors.append(valid_cols)
         all_priorities.append(valid_priorities)
+        all_normals.append(valid_normals)
 
     if len(all_points) == 0:
         raise ValueError("テクスチャを持つ有効な点群が見つかりませんでした（すべての点にテクスチャが存在しないか透明です）。")
@@ -494,12 +498,18 @@ def sample_mesh_with_texture_and_priority(
     points = np.concatenate(all_points, axis=0).astype(np.float32)
     colors = np.concatenate(all_colors, axis=0).astype(np.float32)
     priorities = np.concatenate(all_priorities, axis=0).astype(np.int32)
+    normals = np.concatenate(all_normals, axis=0).astype(np.float32)
 
     # 座標系補正 (COLMAP系 OpenCV: Y-Down, Z-Forward vs glTF OpenGL: Y-Up, -Z Forward)
     # 元のメッシュがすでにOpenCVように対応させているため，通常なら必要なし
     if rotate_x != 0.0 or rotate_y != 0.0 or rotate_z != 0.0:
         points = apply_euler_rotation(points, rotate_x, rotate_y, rotate_z)
+        normals = apply_euler_rotation(normals, rotate_x, rotate_y, rotate_z)
         log(f"  -> [座標系補正] メッシュ点群に回転補正を適用: X={rotate_x}°, Y={rotate_y}°, Z={rotate_z}°")
+
+    # 法線ベクトルの正規化
+    norm_len = np.linalg.norm(normals, axis=1, keepdims=True)
+    normals = np.where(norm_len > 1e-8, normals / np.maximum(norm_len, 1e-8), np.array([[0.0, 0.0, 1.0]], dtype=np.float32))
 
     unique_priorities = np.unique(priorities)
     log(f"  -> 検出されたメッシュインデックス一覧: {unique_priorities.tolist()} (最大値: {int(np.max(unique_priorities))} が最前面)")
@@ -512,7 +522,7 @@ def sample_mesh_with_texture_and_priority(
             f.write("\n".join(log_lines) + "\n")
         print(f"  -> [ログ保存] メッシュ解析ログを保存しました: {mesh_log_path}")
 
-    return points, colors, priorities
+    return points, colors, priorities, normals
 
 
 def convert_mesh_to_gaussian(
@@ -538,7 +548,7 @@ def convert_mesh_to_gaussian(
     if mesh_log_path is None:
         mesh_log_path = os.path.join(os.path.dirname(os.path.abspath(output_gs_path)), "logs", "mesh_log.txt")
 
-    points, colors, priorities = sample_mesh_with_texture_and_priority(
+    points, colors, priorities, normals = sample_mesh_with_texture_and_priority(
         mesh_path=mesh_path,
         num_points=num_points,
         rotate_x=rotate_x,
@@ -551,7 +561,7 @@ def convert_mesh_to_gaussian(
     mesh_bounds = (points.min(axis=0), points.max(axis=0))
 
     # 全体モデルの初期化 (座標は一切変換しない)
-    pcd_full = BasicPointCloud(points=points, colors=colors, normals=None)
+    pcd_full = BasicPointCloud(points=points, colors=colors, normals=normals)
     full_gaussian = VanillaGaussianModel(sh_degree=3)
     full_gaussian.create_from_pcd(pcd_full, spatial_lr_scale=camera_extent)
 
@@ -559,6 +569,7 @@ def convert_mesh_to_gaussian(
     # レイヤー（メッシュ）ごとに中央値スケールを算出し、フチで肥大化した外れ値をクリップした上で 0.55 倍に引き締める
     with torch.no_grad():
         scales = full_gaussian.get_scaling.detach().clone()  # [N, 3]
+        grid_spacing = scales[:, 0].clone()                  # 各デカール点の面内格子間隔を保持
         priorities_t = torch.from_numpy(priorities).to(scales.device)
         for p_val in torch.unique(priorities_t):
             p_mask = (priorities_t == p_val)
@@ -566,8 +577,13 @@ def convert_mesh_to_gaussian(
             if s_sub.shape[0] > 0:
                 median_s = torch.quantile(s_sub[:, 0], 0.5)
                 max_allowed = median_s * 1.15
-                scales[p_mask] = torch.clamp(s_sub, max=max_allowed) * 0.55
+                clamped_s = torch.clamp(s_sub, max=max_allowed)
+                grid_spacing[p_mask] = clamped_s[:, 0]
+                scales[p_mask] = clamped_s * 0.55
         full_gaussian._scaling.data = full_gaussian.scaling_inverse_activation(scales)
+        # Auto-Prune (解決策A) で面内方向/法線方向を分離判定するために法線と格子間隔を保持
+        full_gaussian.mesh_normals = torch.from_numpy(normals).float().to(scales.device)
+        full_gaussian.mesh_grid_spacing = grid_spacing
 
     full_gaussian._opacity.data = torch.ones_like(full_gaussian._opacity.data) * 4.595  # ~0.99
     full_gaussian.save_ply(output_gs_path)
@@ -814,21 +830,25 @@ def prune_overlapping_gaussians(
     depth_tolerance: float = 0.005,
     max_cams_to_check: int = 10,
     mesh_gaussian: Optional[VanillaGaussianModel] = None,
-    max_split_passes: int = 3,
+    max_split_passes: int = 4,
 ) -> int:
     """
-    【解決策2: 大きいガウシアンの自動分割(Split) ＋ 3D最近傍距離によるピンポイント削除】
-    1. メッシュ近傍にかかっている「スケールの大きい既存ガウシアン」をそのまま消すと周囲に穴が空くため、
-       まず長軸方向に沿って小さなガウシアンへ段階的に分割 (Subdivide) する。
-    2. 分割後、メッシュ点群との「3D空間での最短距離（3D最近傍距離）」が prune_margin 以内の点だけを削除し、
-       メッシュ外にはみ出していた片割れ（周囲の下地）はそのまま残すことで見た目の破綻を防ぐ。
+    【解決策A: 面内(横)方向のはみ出し削除を禁止し、デカール真下のみを法線厚みでくり抜く方式】
+    1. 既存ガウシアンと最近傍メッシュ点の距離ベクトルを「面内方向距離 d_parallel (横ズレ)」と
+       「法線方向距離 d_perp (垂直の厚み)」に分解する。
+    2. メッシュ境界にかかっている大きい既存ガウシアンを長軸方向に細分割 (最大 max_split_passes 回) する。
+    3. 削除判定では、横方向 (d_parallel) はデカールの点間隔以内 (=デカール輪郭の真下・内側のみ) に厳密制限し、
+       垂直方向 (d_perp) のみ prune_margin 以内をくり抜く。
+       これにより、デカールの外周（輪郭の外側）に空白の溝ができるのを防ぐ。
     """
-    print(f"\n[Step 4: Auto-Prune] 大スケールガウシアンの自動分割 ＆ 3D最近傍距離くり抜きを開始 (閾値: {prune_margin})...")
+    print(f"\n[Step 4: Auto-Prune] 面内・法線分離判定による境界空白ゼロくり抜きを開始 (法線厚み閾値: {prune_margin})...")
     device = base_gaussian.get_xyz.device
 
-    # 1. 追加メッシュの3D点群座標を取得 (オクルーダーではない実体メッシュの点群のみ)
+    # 1. 追加メッシュの3D点群座標・法線・格子間隔を取得
     if mesh_gaussian is not None and mesh_gaussian.get_xyz.shape[0] > 0:
         mesh_xyz = mesh_gaussian.get_xyz.detach()
+        mesh_normals = getattr(mesh_gaussian, "mesh_normals", None)
+        mesh_spacing = getattr(mesh_gaussian, "mesh_grid_spacing", None)
     else:
         layer_xyz_list = [
             sub_gs.get_xyz.detach()
@@ -839,31 +859,64 @@ def prune_overlapping_gaussians(
         if len(layer_xyz_list) == 0:
             return 0
         mesh_xyz = torch.cat(layer_xyz_list, dim=0)
+        mesh_normals = None
+        mesh_spacing = None
 
     M_mesh = mesh_xyz.shape[0]
+    if mesh_normals is None or mesh_normals.shape[0] != M_mesh:
+        mesh_normals = torch.zeros((M_mesh, 3), dtype=torch.float32, device=device)
+        mesh_normals[:, 2] = 1.0
+    if mesh_spacing is None or mesh_spacing.shape[0] != M_mesh:
+        mesh_spacing = torch.full((M_mesh,), 0.002, dtype=torch.float32, device=device)
+
     cand_batch_size = 4096
     mesh_chunk_size = 32768
 
-    def compute_min_dists_to_mesh(query_xyz: torch.Tensor) -> torch.Tensor:
-        """query_xyz [Q, 3] の各点から mesh_xyz [M_mesh, 3] までの3D最短距離を計算する"""
+    def compute_decomposed_dists(query_xyz: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        query_xyz [Q, 3] の各点について、最近傍メッシュ点までの:
+        - min_d3d: 3Dユークリッド距離
+        - d_perp: 法線方向（垂直厚み）距離 |(x - p) . n|
+        - d_parallel: 面内方向（横ズレ）距離 sqrt(|x - p|^2 - d_perp^2)
+        - nearest_spacing: 最近傍メッシュ点の格子間隔 h
+        を返す。
+        """
         q_count = query_xyz.shape[0]
-        out_dists = torch.full((q_count,), float("inf"), dtype=torch.float32, device=device)
+        min_d3d = torch.full((q_count,), float("inf"), dtype=torch.float32, device=device)
+        nearest_idx = torch.zeros((q_count,), dtype=torch.long, device=device)
+
         for i in range(0, q_count, cand_batch_size):
             c_batch = query_xyz[i : i + cand_batch_size]
-            batch_min = torch.full((c_batch.shape[0],), float("inf"), dtype=torch.float32, device=device)
+            b_min = torch.full((c_batch.shape[0],), float("inf"), dtype=torch.float32, device=device)
+            b_idx = torch.zeros((c_batch.shape[0],), dtype=torch.long, device=device)
+
             for j in range(0, M_mesh, mesh_chunk_size):
                 m_chunk = mesh_xyz[j : j + mesh_chunk_size]
                 dists = torch.cdist(c_batch, m_chunk, p=2.0)
-                batch_min = torch.minimum(batch_min, dists.min(dim=1)[0])
-            out_dists[i : i + cand_batch_size] = batch_min
-        return out_dists
+                c_min, c_argmin = dists.min(dim=1)
+                better = c_min < b_min
+                b_min = torch.where(better, c_min, b_min)
+                b_idx = torch.where(better, c_argmin + j, b_idx)
+
+            min_d3d[i : i + cand_batch_size] = b_min
+            nearest_idx[i : i + cand_batch_size] = b_idx
+
+        nearest_pts = mesh_xyz[nearest_idx]          # [Q, 3]
+        nearest_norms = mesh_normals[nearest_idx]    # [Q, 3]
+        nearest_h = mesh_spacing[nearest_idx]        # [Q]
+
+        diff_vec = query_xyz - nearest_pts           # [Q, 3]
+        d_perp = torch.abs((diff_vec * nearest_norms).sum(dim=1))
+        d_parallel = torch.sqrt(torch.clamp(min_d3d * min_d3d - d_perp * d_perp, min=0.0))
+        return min_d3d, d_perp, d_parallel, nearest_h
 
     min_b, max_b = mesh_bounds
     min_b_t = torch.from_numpy(min_b).float().to(device)
     max_b_t = torch.from_numpy(max_b).float().to(device)
 
-    # 2. メッシュ近傍にかかっている「大きいガウシアン」を長軸方向に沿って段階的に2分割 (最大 max_split_passes 回)
-    split_scale_thresh = max(prune_margin * 0.5, 0.002)
+    # 2. メッシュ境界付近にかかっている「大きいガウシアン」を長軸方向に沿って細分割 (最大 max_split_passes 回)
+    median_grid_h = float(torch.quantile(mesh_spacing, 0.5).item())
+    split_scale_thresh = max(median_grid_h * 1.5, 0.001)
     total_split_count = 0
 
     with torch.no_grad():
@@ -872,7 +925,7 @@ def prune_overlapping_gaussians(
             scales_curr = base_gaussian.get_scaling.detach()  # 実空間での3軸スケール [N, 3]
             s_max, max_axis = scales_curr.max(dim=1)          # 最大軸の長さと軸インデックス (0, 1, 2)
 
-            # ガウシアンの楕円体がメッシュAABBに届き得る範囲 (prune_margin + 2.5 * s_max) で粗選抜
+            # ガウシアンの楕円体がメッシュAABBに届き得る範囲で粗選抜
             reach = prune_margin + 2.5 * s_max
             in_reach_bbox = (
                 (s_max > split_scale_thresh) &
@@ -885,9 +938,14 @@ def prune_overlapping_gaussians(
             if reach_indices.numel() == 0:
                 break
 
-            # メッシュ点群までの最短距離が「prune_margin + 2.0 * s_max」以内の大ガウシアンのみ分割対象とする
-            d_reach = compute_min_dists_to_mesh(xyz_curr[reach_indices])
-            need_split_local = d_reach <= (prune_margin + 2.0 * s_max[reach_indices])
+            _, d_perp_r, d_par_r, h_r = compute_decomposed_dists(xyz_curr[reach_indices])
+            s_max_r = s_max[reach_indices]
+
+            # デカール領域（面内: h_r * 1.15, 法線: prune_margin）に楕円体(2.0 * s_max)が差し掛かる大ガウシアンを分割
+            need_split_local = (
+                (d_par_r <= h_r * 1.15 + 2.0 * s_max_r) &
+                (d_perp_r <= prune_margin + 2.0 * s_max_r)
+            )
             split_indices = reach_indices[need_split_local]
             num_to_split = split_indices.numel()
 
@@ -938,9 +996,10 @@ def prune_overlapping_gaussians(
             base_gaussian._rotation = torch.nn.Parameter(torch.cat([base_gaussian._rotation.detach()[keep_unsplit], new_rot], dim=0).requires_grad_(True))
 
         if total_split_count > 0:
-            print(f"  -> メッシュ境界付近の大きいガウシアン計 {total_split_count:,} 点を細分割しました (欠損防止)")
+            print(f"  -> メッシュ境界付近の大きいガウシアン計 {total_split_count:,} 点を細分割しました (境界空白防止)")
 
-        # 3. 細分割後の点群に対して、メッシュ表面から prune_margin 以内の点のみをピンポイント削除
+        # 3. 細分割後の点群に対して、「面内方向はデカール輪郭の内側のみ (d_parallel <= h * 1.15)」かつ
+        #    「法線方向は prune_margin 以内 (d_perp <= prune_margin)」の点のみを削除
         xyz = base_gaussian.get_xyz.detach()
         N = xyz.shape[0]
         margin_vec = torch.tensor(prune_margin, device=device)
@@ -957,15 +1016,18 @@ def prune_overlapping_gaussians(
         cand_count = candidate_indices.shape[0]
         print(f"  -> メッシュAABB近傍の最終候補点数: {cand_count:,} / {N:,} 点")
         if cand_count == 0:
-            # 補助バッファを同期して終了
             if hasattr(base_gaussian, "max_radii2D"):
                 base_gaussian.max_radii2D = torch.zeros(N, device=device)
             if hasattr(base_gaussian, "_generation"):
                 base_gaussian._generation = torch.zeros(N, dtype=torch.int64, device=device)
             return 0
 
-        min_dists = compute_min_dists_to_mesh(xyz[candidate_indices])
-        prune_mask_cand = (min_dists <= prune_margin)
+        _, d_perp, d_parallel, h_nearest = compute_decomposed_dists(xyz[candidate_indices])
+
+        # 横方向(d_parallel)はデカール点間隔(h_nearest * 1.15)以内に厳密制限し、外周の下地ガウシアンは一切削らない
+        in_decal_footprint = d_parallel <= torch.clamp(h_nearest * 1.15, min=0.0005)
+        in_normal_thickness = d_perp <= prune_margin
+        prune_mask_cand = in_decal_footprint & in_normal_thickness
 
         pruned_indices = candidate_indices[prune_mask_cand]
         num_pruned = pruned_indices.shape[0]
