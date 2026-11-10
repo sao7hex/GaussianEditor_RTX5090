@@ -184,15 +184,21 @@ def sample_colors_from_submesh(
     points: np.ndarray,
     face_indices: np.ndarray,
     default_color: Tuple[float, float, float] = (0.8, 0.8, 0.8),
-) -> Tuple[np.ndarray, np.ndarray]:
+    return_alpha: bool = False,
+):
     """
     サブメッシュから色 (RGB [0, 1]) をバイリニア補間で滑らかに取得し、
-    同時に点単位でテクスチャが存在するかのマスク (has_tex_mask) を返す。
+    同時に点単位でテクスチャが存在するかのマスク (has_tex_mask) と、
+    デカール外周を滑らかに減衰させたフェザリング不透明度 (feathered_alphas) を返す。
     UV未展開面や透明部分は has_tex_mask = False となる。
     """
     n_pts = points.shape[0]
     if n_pts == 0:
-        return np.empty((0, 3), dtype=np.float32), np.empty(0, dtype=bool)
+        empty_c = np.empty((0, 3), dtype=np.float32)
+        empty_m = np.empty(0, dtype=bool)
+        if return_alpha:
+            return empty_c, empty_m, np.empty(0, dtype=np.float32)
+        return empty_c, empty_m
 
     tex_img = None
     base_factor = None
@@ -212,6 +218,8 @@ def sample_colors_from_submesh(
 
     if tex_img is not None and hasattr(mesh.visual, "uv") and mesh.visual.uv is not None and len(mesh.visual.uv) > 0:
         try:
+            from scipy.ndimage import distance_transform_edt
+
             tex_np = np.asarray(tex_img, dtype=np.float32) / 255.0
             tex_h, tex_w = tex_np.shape[:2]
 
@@ -257,15 +265,36 @@ def sample_colors_from_submesh(
 
             has_tex_mask = valid_uv & (~is_zero_uv)
             if tex_np.shape[2] >= 4:
-                alphas = c_interp[:, 3]
-                # 半透明の境界にじみを防ぐためアルファ閾値を 0.15 に設定
-                has_tex_mask = has_tex_mask & (alphas > 0.15)
+                raw_alphas = c_interp[:, 3]
+                has_tex_mask = has_tex_mask & (raw_alphas > 0.08)
+                fg_mask_tex = tex_np[:, :, 3] > 0.08
+            else:
+                raw_alphas = np.ones(n_pts, dtype=np.float32)
+                fg_mask_tex = np.ones((tex_h, tex_w), dtype=bool)
+
+            if return_alpha:
+                # 【アイデア3: デカール外周のアルファ・フェザリング】
+                # テクスチャの透明境界および画像外枠からのピクセル距離変換で外周の不透明度を滑らかに減衰
+                padded_fg = np.pad(fg_mask_tex, pad_width=1, mode="constant", constant_values=False)
+                dist_px_map = distance_transform_edt(padded_fg)[1:-1, 1:-1].astype(np.float32)
+                feather_px = max(3.0, min(tex_h, tex_w) * 0.02)
+                dist_sampled = (
+                    (1.0 - du[:, 0]) * (1.0 - dv[:, 0]) * dist_px_map[v0, u0]
+                    + du[:, 0] * (1.0 - dv[:, 0]) * dist_px_map[v0, u1]
+                    + (1.0 - du[:, 0]) * dv[:, 0] * dist_px_map[v1, u0]
+                    + du[:, 0] * dv[:, 0] * dist_px_map[v1, u1]
+                )
+                t_edge = np.clip(dist_sampled / feather_px, 0.0, 1.0)
+                edge_feather = t_edge * t_edge * (3.0 - 2.0 * t_edge)  # Smoothstep
+                feathered_alphas = np.clip(raw_alphas * edge_feather, 0.05, 0.99).astype(np.float32)
+                return colors.astype(np.float32), has_tex_mask, feathered_alphas
 
             return colors.astype(np.float32), has_tex_mask
         except Exception as e:
             print(f"  [Warning] テクスチャサンプリング失敗: {e}")
 
     has_tex_mask = np.zeros(n_pts, dtype=bool)
+    default_alphas = np.full(n_pts, 0.99, dtype=np.float32)
 
     if hasattr(mesh.visual, "vertex_colors") and mesh.visual.vertex_colors is not None and len(mesh.visual.vertex_colors) > 0:
         v_colors = mesh.visual.vertex_colors[:, :3].astype(np.float32)
@@ -275,11 +304,17 @@ def sample_colors_from_submesh(
         tri_verts = mesh.vertices[faces]
         barycentric = trimesh.triangles.points_to_barycentric(tri_verts, points)
         colors = np.sum(v_colors[faces] * barycentric[:, :, None], axis=1)
+        if return_alpha:
+            return colors.astype(np.float32), has_tex_mask, default_alphas
         return colors.astype(np.float32), has_tex_mask
 
     if base_factor is not None:
-        return np.full((n_pts, 3), base_factor, dtype=np.float32), has_tex_mask
-    return np.full((n_pts, 3), default_color, dtype=np.float32), has_tex_mask
+        cols_out = np.full((n_pts, 3), base_factor, dtype=np.float32)
+    else:
+        cols_out = np.full((n_pts, 3), default_color, dtype=np.float32)
+    if return_alpha:
+        return cols_out, has_tex_mask, default_alphas
+    return cols_out, has_tex_mask
 
 
 
@@ -460,6 +495,7 @@ def sample_mesh_with_texture_and_priority(
     all_colors = []
     all_priorities = []
     all_normals = []
+    all_alphas = []
 
     log(f"\n  -> 各メッシュへの有効点数割り当て結果 (有効目標合計: {num_points:,} 点, 均一グリッドサンプリング):")
     for (mesh, p_idx, name, v_ratio, eff_area), target_valid_count in zip(valid_submeshes_info, sub_counts):
@@ -471,13 +507,16 @@ def sample_mesh_with_texture_and_priority(
         raw_grid_count = min(raw_grid_count, target_valid_count * 25)  # 安全上限
 
         pts, face_indices = sample_surface_uniform_grid(mesh, raw_grid_count)
-        cols, has_tex_mask = sample_colors_from_submesh(mesh, pts, face_indices)
+        cols, has_tex_mask, alphas = sample_colors_from_submesh(
+            mesh, pts, face_indices, return_alpha=True
+        )
 
         if not np.any(has_tex_mask):
             continue
 
         valid_pts = pts[has_tex_mask]
         valid_cols = cols[has_tex_mask]
+        valid_alphas = alphas[has_tex_mask]
         valid_priorities = np.full(len(valid_pts), p_idx, dtype=np.int32)
         face_norms = np.asarray(mesh.face_normals, dtype=np.float32)
         valid_normals = face_norms[face_indices[has_tex_mask]]
@@ -491,6 +530,7 @@ def sample_mesh_with_texture_and_priority(
         all_colors.append(valid_cols)
         all_priorities.append(valid_priorities)
         all_normals.append(valid_normals)
+        all_alphas.append(valid_alphas)
 
     if len(all_points) == 0:
         raise ValueError("テクスチャを持つ有効な点群が見つかりませんでした（すべての点にテクスチャが存在しないか透明です）。")
@@ -499,6 +539,7 @@ def sample_mesh_with_texture_and_priority(
     colors = np.concatenate(all_colors, axis=0).astype(np.float32)
     priorities = np.concatenate(all_priorities, axis=0).astype(np.int32)
     normals = np.concatenate(all_normals, axis=0).astype(np.float32)
+    alphas = np.concatenate(all_alphas, axis=0).astype(np.float32)
 
     # 座標系補正 (COLMAP系 OpenCV: Y-Down, Z-Forward vs glTF OpenGL: Y-Up, -Z Forward)
     # 元のメッシュがすでにOpenCVように対応させているため，通常なら必要なし
@@ -522,7 +563,7 @@ def sample_mesh_with_texture_and_priority(
             f.write("\n".join(log_lines) + "\n")
         print(f"  -> [ログ保存] メッシュ解析ログを保存しました: {mesh_log_path}")
 
-    return points, colors, priorities, normals
+    return points, colors, priorities, normals, alphas
 
 
 def convert_mesh_to_gaussian(
@@ -548,7 +589,7 @@ def convert_mesh_to_gaussian(
     if mesh_log_path is None:
         mesh_log_path = os.path.join(os.path.dirname(os.path.abspath(output_gs_path)), "logs", "mesh_log.txt")
 
-    points, colors, priorities, normals = sample_mesh_with_texture_and_priority(
+    points, colors, priorities, normals, alphas = sample_mesh_with_texture_and_priority(
         mesh_path=mesh_path,
         num_points=num_points,
         rotate_x=rotate_x,
@@ -585,7 +626,11 @@ def convert_mesh_to_gaussian(
         full_gaussian.mesh_normals = torch.from_numpy(normals).float().to(scales.device)
         full_gaussian.mesh_grid_spacing = grid_spacing
 
-    full_gaussian._opacity.data = torch.ones_like(full_gaussian._opacity.data) * 4.595  # ~0.99
+        # 【アイデア3: デカール外周のアルファ・フェザリング反映】
+        # 内部は ~0.99 (logit 4.595)、外周エッジに向かって滑らかに不透明度を減衰させる
+        alphas_t = torch.from_numpy(np.clip(alphas, 0.05, 0.99)).float().to(scales.device)[:, None]
+        full_gaussian._opacity.data = full_gaussian.inverse_opacity_activation(alphas_t)
+
     full_gaussian.save_ply(output_gs_path)
 
     # 内部Zバッファテスト用レイヤーの構築 (オクルーダーは廃止し、すべてマスク描画対象 is_occluder=False とする)
@@ -1081,15 +1126,19 @@ def refine_with_diffusion(
     max_grad: float = 1e-4,
     max_densify_percent: float = 0.01,
     min_opacity: float = 0.005,
+    ring_radius_px: int = 7,
+    lambda_tv_ring: float = 15.0,
 ):
     """
     GaussianEditor の InstructPix2Pix / EditGuidance を直接呼び出し、
-    結合後のシーンの境界部分を拡散モデルで最適化（色・位置・スケール・回転・不透明度の調整および分割・複製・除去）する。
+    【アイデア4】2D境界リングマスクによる局所インペイント＆境界TV平滑化損失を用いて、
+    デカール内部のシャープさと背景を維持したまま境界の継ぎ目のみを集中最適化する。
     """
-    print(f"\n[Step 5: Refine] 拡散モデルによるテクスチャ＆境界ブレンディングを開始...")
-    print(f"  -> プロンプト: '{prompt}', 最適化ステップ数: {refine_steps}")
+    print(f"\n[Step 5: Refine] 拡散モデル＆境界リングマスクによる局所ブレンディングを開始...")
+    print(f"  -> プロンプト: '{prompt}', 最適化ステップ数: {refine_steps}, 境界リング幅: ±{ring_radius_px}px")
 
     import random
+    import torch.nn.functional as F
     from tqdm import trange
     from omegaconf import OmegaConf
     from threestudio.utils.perceptual import PerceptualLoss
@@ -1112,9 +1161,49 @@ def refine_with_diffusion(
 
     gaussian.training_setup(opt)
 
-    # デカール周辺の既存境界ガウシアンもマスク (gaussian.mask = True) に含め、分割・複製・除去・移動を許可する
+    # 追加されたデカール点群のマスクを保持 (2D境界リングマスク生成用)
     with torch.no_grad():
         decal_mask = gaussian.mask.detach().clone().squeeze()
+
+    # 3. 各カメラ視点の基準画像 ＆ 【アイデア4】2D境界リングマスクを事前キャッシュ・保存
+    perceptual_loss = PerceptualLoss().eval().to("cuda")
+    bg_color = torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32, device="cuda")
+
+    train_cams = scene.getTrainCameras()
+    H, W = train_cams[0].image_height, train_cams[0].image_width
+
+    origin_render_dir = os.path.join(output_dir, "origin_renders")
+    os.makedirs(origin_render_dir, exist_ok=True)
+    print(f"  -> 各カメラ視点の初期レンダリング画像および2D境界リングマスクを生成・保存中 ({origin_render_dir})...")
+    origin_frames = {}
+    ring_masks = {}
+    k_size = 2 * ring_radius_px + 1
+
+    with torch.no_grad():
+        decal_override_color = decal_mask[:, None].float().repeat(1, 3)
+        for i, cam in enumerate(train_cams):
+            r_pkg = render(cam, gaussian, pipe, bg_color)
+            rendered_tensor = r_pkg["render"].detach().clone()
+            origin_frames[i] = rendered_tensor
+
+            # デカール領域の2Dシルエットを描画し、モルフォロジー膨張・収縮で「境界リングマスク」を生成
+            mask_pkg = render(cam, gaussian, pipe, bg_color, override_color=decal_override_color)
+            decal_2d = (mask_pkg["render"].mean(dim=0, keepdim=True) > 0.15).float()[None]  # [1, 1, H, W]
+            dilated = F.max_pool2d(decal_2d, kernel_size=k_size, stride=1, padding=ring_radius_px)
+            eroded = 1.0 - F.max_pool2d(1.0 - decal_2d, kernel_size=k_size, stride=1, padding=ring_radius_px)
+            raw_ring = (dilated - eroded).clamp(0.0, 1.0)
+            soft_ring = F.avg_pool2d(raw_ring, kernel_size=5, stride=1, padding=2)[0]  # [1, H, W]
+            ring_masks[i] = soft_ring.detach()
+
+            # [3, H, W] (0.0~1.0) -> [H, W, 3] (0~255 uint8) に変換してPNG保存
+            img_np = (rendered_tensor.clamp(0.0, 1.0).permute(1, 2, 0).cpu().numpy() * 255.0).astype(np.uint8)
+            cam_name = getattr(cam, "image_name", None)
+            filename = f"render_cam_{i:04d}_{cam_name}.png" if cam_name else f"render_cam_{i:04d}.png"
+            Image.fromarray(img_np).save(os.path.join(origin_render_dir, filename))
+    print(f"  -> 全 {len(train_cams)} 視点の初期レンダリング画像と境界リングマスクを作成しました: {origin_render_dir}")
+
+    # デカール周辺の既存境界ガウシアンもマスク (gaussian.mask = True) に含め、分割・複製・除去・移動を許可する
+    with torch.no_grad():
         if decal_mask.any() and (~decal_mask).any() and boundary_dist_thresh > 0:
             near_bg_mask = gaussian.get_near_gaussians_by_mask(
                 decal_mask, dist_thresh=boundary_dist_thresh
@@ -1145,35 +1234,11 @@ def refine_with_diffusion(
         })
     )
 
-    perceptual_loss = PerceptualLoss().eval().to("cuda")
-    bg_color = torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32, device="cuda")
-
-    train_cams = scene.getTrainCameras()
-    H, W = train_cams[0].image_height, train_cams[0].image_width
-
-    # 3. 各カメラ視点の基準画像を事前キャッシュ ＆ 画像ファイルとして保存
-    origin_render_dir = os.path.join(output_dir, "origin_renders")
-    os.makedirs(origin_render_dir, exist_ok=True)
-    print(f"  -> 各カメラ視点の初期レンダリング画像を事前取得・保存中 ({origin_render_dir})...")
-    origin_frames = {}
-    with torch.no_grad():
-        for i, cam in enumerate(train_cams):
-            r_pkg = render(cam, gaussian, pipe, bg_color)
-            rendered_tensor = r_pkg["render"].detach().clone()
-            origin_frames[i] = rendered_tensor
-
-            # [3, H, W] (0.0~1.0) -> [H, W, 3] (0~255 uint8) に変換してPNG保存
-            img_np = (rendered_tensor.clamp(0.0, 1.0).permute(1, 2, 0).cpu().numpy() * 255.0).astype(np.uint8)
-            cam_name = getattr(cam, "image_name", None)
-            filename = f"render_cam_{i:04d}_{cam_name}.png" if cam_name else f"render_cam_{i:04d}.png"
-            Image.fromarray(img_np).save(os.path.join(origin_render_dir, filename))
-    print(f"  -> 全 {len(train_cams)} 視点の初期レンダリング画像を保存しました: {origin_render_dir}")
-
     edit_frames = {}
     densify_until_iter = max(refine_steps - 10, 1)
     cameras_extent = getattr(scene, "cameras_extent", 1.0)
 
-    # 4. 最適化ループ (色・位置・スケール・回転・不透明度の最適化 ＋ ガウシアンの分割・複製・除去)
+    # 4. 最適化ループ (境界リング領域のみの局所インペイント ＋ 境界TV平滑化 ＋ 分割・複製・除去)
     print(f"  -> 最適化ループを実行中 (0 ~ {refine_steps} steps, 分割・除去間隔: {densification_interval} steps)...")
     pbar = trange(refine_steps, desc="Refining Gaussian Splatting")
     for step in pbar:
@@ -1187,28 +1252,40 @@ def refine_with_diffusion(
         visibility_filter = render_pkg["visibility_filter"]
         radii = render_pkg["radii"]
 
-        # InstructPix2Pix で目標画像を生成
+        ring_mask = ring_masks[cam_idx]  # [1, H, W]
+        origin_img = origin_frames[cam_idx]
+
+        # InstructPix2Pix で目標画像を生成し、境界リング領域 (ring_mask) のみにブレンド適用
         if cam_idx not in edit_frames or (step % per_editing_step == 0):
             with torch.no_grad():
                 result = ip2p(
                     image[None].permute(0, 2, 3, 1),
-                    origin_frames[cam_idx][None].permute(0, 2, 3, 1),
+                    origin_img[None].permute(0, 2, 3, 1),
                     prompt_utils,
                 )
-                edited_image = torch.nn.functional.interpolate(
+                edited_raw = F.interpolate(
                     result["edit_images"].permute(0, 3, 1, 2),
                     (H, W),
                     mode="bilinear",
                     align_corners=False,
                 )[0]
-                edit_frames[cam_idx] = edited_image.detach()
+                # 【アイデア4】デカール内部と外側背景は初期レンダリング画像を厳密維持し、境界リングのみ拡散モデルでブレンド
+                blended_target = ring_mask * edited_raw.detach() + (1.0 - ring_mask) * origin_img
+                edit_frames[cam_idx] = blended_target.detach()
 
         gt_image = edit_frames[cam_idx]
 
-        # L1 + Perceptual Loss
-        loss_l1 = torch.nn.functional.l1_loss(image, gt_image)
+        # 境界リング領域に重みを置いた L1 Loss + Perceptual Loss
+        pixel_weights = 1.0 + 4.0 * ring_mask
+        loss_l1 = (torch.abs(image - gt_image) * pixel_weights).mean()
         loss_p = perceptual_loss(image[None].contiguous(), gt_image[None].contiguous()).sum()
-        loss = 10.0 * loss_l1 + 10.0 * loss_p
+
+        # 【アイデア4】境界リング領域の局所 Total Variation (TV) 平滑化損失 (隙間や段差を滑らかに埋める)
+        diff_h = torch.abs(image[:, 1:, :] - image[:, :-1, :]) * ring_mask[:, 1:, :]
+        diff_w = torch.abs(image[:, :, 1:] - image[:, :, :-1]) * ring_mask[:, :, 1:]
+        loss_tv_ring = (diff_h.sum() + diff_w.sum()) / (ring_mask.sum() * 3.0 + 1e-5)
+
+        loss = 10.0 * loss_l1 + 10.0 * loss_p + lambda_tv_ring * loss_tv_ring
 
         # アンカーロス（幾何形状・スケールの安定化）
         if hasattr(gaussian, "anchor_loss"):
@@ -1248,9 +1325,13 @@ def refine_with_diffusion(
                 )
 
         if step % 10 == 0:
-            pbar.set_postfix({"L1": f"{loss_l1.item():.4f}", "Loss": f"{loss.item():.4f}", "Pts": f"{gaussian.get_xyz.shape[0]:,}"})
+            pbar.set_postfix({
+                "L1": f"{loss_l1.item():.4f}",
+                "TV": f"{loss_tv_ring.item():.4f}",
+                "Pts": f"{gaussian.get_xyz.shape[0]:,}",
+            })
 
-    print(f"  -> 拡散モデルによる境界ブレンディングが完了しました！")
+    print(f"  -> 拡散モデル＆境界リングマスクによる局所ブレンディングが完了しました！")
 
 
 # ==============================================================================
