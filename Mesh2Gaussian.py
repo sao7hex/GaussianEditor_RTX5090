@@ -293,17 +293,34 @@ def sample_mesh_with_texture_and_priority(
             mesh_idx = extract_mesh_index(node_name, default_idx)
 
             # 親ノードの取得と階層行列の合成計算 (T_parent_world @ T_child_local)
-            parent_node = parents_map.get(node_name, base_frame)
             try:
-                # 親ノードのワールド変換行列
-                T_parent_world, _ = loaded.graph.get(frame_to=parent_node, frame_from=base_frame)
-                # 親に対する子ノードのローカル変換行列
-                T_child_local, _ = loaded.graph.get(frame_to=node_name, frame_from=parent_node)
-                # 親ノードの行列と子のローカル行列を行列積で合成
-                transform = T_parent_world @ T_child_local
+                if node_name in parents_map:
+                    parent_node = parents_map[node_name]
+                    if parent_node == base_frame:
+                        T_parent_world = np.eye(4)
+                    else:
+                        T_parent_world, _ = loaded.graph.get(frame_to=parent_node, frame_from=base_frame)
+                    T_child_local, _ = loaded.graph.get(frame_to=node_name, frame_from=parent_node)
+                    transform = T_parent_world @ T_child_local
+                else:
+                    transform, _ = loaded.graph.get(frame_to=node_name, frame_from=base_frame)
             except Exception:
-                # 万が一のフォールバック (単一ノード直接取得)
-                transform = loaded.graph.get(node_name)[0] if node_name in loaded.graph else np.eye(4)
+                # world からのパスが存在しない独立ノード (例: 'GLTF' ルートノード等) の安全なフォールバック
+                try:
+                    transform = np.eye(4)
+                    edge_data = getattr(loaded.graph.transforms, "edge_data", {})
+                    curr = node_name
+                    visited = set()
+                    while curr in parents_map and curr not in visited:
+                        visited.add(curr)
+                        p = parents_map[curr]
+                        mat = edge_data.get((p, curr), {}).get("matrix", np.eye(4))
+                        transform = mat @ transform
+                        curr = p
+                    if (curr, curr) in edge_data:
+                        transform = edge_data[(curr, curr)].get("matrix", np.eye(4)) @ transform
+                except Exception:
+                    transform = np.eye(4)
 
             geom_transformed = geom.copy()
             geom_transformed.apply_transform(transform)
