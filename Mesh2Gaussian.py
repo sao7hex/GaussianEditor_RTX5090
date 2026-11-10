@@ -917,16 +917,18 @@ def prune_overlapping_gaussians(
     min_b_t = torch.from_numpy(min_b).float().to(device)
     max_b_t = torch.from_numpy(max_b).float().to(device)
 
-    # 2. デカール境界（および横方向の外側帯域）にかかっている既存ガウシアンを、
-    #    通常の3Dガウシアン確率分布 (3軸スケール stds + 回転行列 R による torch.normal) から細かく再サンプリング
+    # 2. デカール境界（および横方向の外側帯域）にかかっている既存ガウシアンを2D接平面グリッドで細かく再サンプリング
     median_grid_h = float(torch.quantile(mesh_spacing, 0.5).item())
     split_scale_thresh = max(median_grid_h * 1.1, 0.0006)
     total_split_count = 0
     total_spawned_count = 0
 
-    # 3DGS標準の densify_and_split と同じく 3次元正規分布 N(0, diag(sx^2, sy^2, sz^2)) からサンプリング
-    n_split_samples = 4  # 1パスあたりの3Dガウス分布サンプル数
-    scale_div = 1.6      # 3DGS標準のスケール縮小率 (0.8 * 2)
+    # 1回のパスで親ガウシアンの長軸2方向 (u0, u1) に 3x3 = 9 個のサブガウシアンへ細かく2D再サンプリング
+    grid_1d = torch.linspace(-0.75, 0.75, 3, device=device)
+    gu, gv = torch.meshgrid(grid_1d, grid_1d, indexing="ij")
+    gu_flat = gu.reshape(-1)  # [9]
+    gv_flat = gv.reshape(-1)  # [9]
+    num_sub = gu_flat.numel()
 
     with torch.no_grad():
         for pass_idx in range(max_split_passes):
@@ -965,7 +967,7 @@ def prune_overlapping_gaussians(
                 break
 
             total_split_count += num_to_split
-            total_spawned_count += num_to_split * n_split_samples
+            total_spawned_count += num_to_split * num_sub
 
             # 再サンプリング対象のパラメータを取得
             xyz_sp = base_gaussian._xyz.detach()[split_indices]
@@ -975,23 +977,39 @@ def prune_overlapping_gaussians(
             rot_sp = base_gaussian._rotation.detach()[split_indices]
             scales_sp = scales_curr[split_indices]
 
-            # 通常の3Dガウシアン分割 (GaussianModel.densify_and_split 準拠):
-            # 3軸スケール (sx, sy, sz) を標準偏差とする3次元正規分布からサンプリングし、回転行列 R でワールド座標へ変換
-            stds = scales_sp.repeat(n_split_samples, 1)
-            means = torch.zeros((stds.size(0), 3), device=device)
-            samples = torch.normal(mean=means, std=stds)
-            rots = build_rotation(rot_sp).repeat(n_split_samples, 1, 1)
-            new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + xyz_sp.repeat(n_split_samples, 1)
+            # スケールが大きい上位2軸 (接平面の主軸 axis0, axis1) を取得
+            sorted_scales, sorted_axes = torch.sort(scales_sp, dim=1, descending=True)
+            axis0 = sorted_axes[:, 0]
+            axis1 = sorted_axes[:, 1]
+            s0 = sorted_scales[:, 0]
+            s1 = sorted_scales[:, 1]
 
-            new_scaling = base_gaussian.scaling_inverse_activation(
-                scales_sp.repeat(n_split_samples, 1) / scale_div
-            )
-            new_rot = rot_sp.repeat(n_split_samples, 1)
-            new_f_dc = f_dc_sp.repeat(n_split_samples, 1, 1)
-            new_f_rest = f_rest_sp.repeat(n_split_samples, 1, 1)
-            new_opac = opac_sp.repeat(n_split_samples, 1)
+            # クォータニオンから回転行列 [M, 3, 3] を求め、上位2主軸のワールド方向ベクトルを取得
+            rots_mat = build_rotation(rot_sp)  # [M, 3, 3]
+            arange_m = torch.arange(num_to_split, device=device)
+            dir0 = rots_mat[arange_m, :, axis0]  # [M, 3]
+            dir1 = rots_mat[arange_m, :, axis1]  # [M, 3]
 
-            # 元の粗い親ガウシアンを除外し、3Dガウス分布から再サンプリングされた子ガウシアン群を追加
+            # 2D接平面グリッド (3x3 = 9点) 上へ細かく再サンプリング配置
+            offsets = (
+                gu_flat[None, :, None] * s0[:, None, None] * dir0[:, None, :] +
+                gv_flat[None, :, None] * s1[:, None, None] * dir1[:, None, :]
+            )  # [M, 9, 3]
+            new_xyz = (xyz_sp[:, None, :] + offsets).reshape(-1, 3)
+
+            # 2Dグリッド間隔に合わせて主軸2方向のスケールを縮小し、隙間なく連続シート状に敷き詰める
+            new_scales_linear = scales_sp.clone()
+            new_scales_linear[arange_m, axis0] = s0 / 2.2
+            new_scales_linear[arange_m, axis1] = torch.where(s1 > split_scale_thresh, s1 / 2.2, s1 / 1.5)
+            new_scaling_single = base_gaussian.scaling_inverse_activation(new_scales_linear)
+            new_scaling = new_scaling_single[:, None, :].expand(-1, num_sub, -1).reshape(-1, 3)
+
+            new_f_dc = f_dc_sp[:, None, :, :].expand(-1, num_sub, -1, -1).reshape(-1, f_dc_sp.shape[1], f_dc_sp.shape[2])
+            new_f_rest = f_rest_sp[:, None, :, :].expand(-1, num_sub, -1, -1).reshape(-1, f_rest_sp.shape[1], f_rest_sp.shape[2])
+            new_opac = opac_sp[:, None, :].expand(-1, num_sub, -1).reshape(-1, opac_sp.shape[1])
+            new_rot = rot_sp[:, None, :].expand(-1, num_sub, -1).reshape(-1, rot_sp.shape[1])
+
+            # 元の粗い親ガウシアンを除外し、2D再サンプリングされたサブガウシアン群を追加
             keep_unsplit = torch.ones(xyz_curr.shape[0], dtype=torch.bool, device=device)
             keep_unsplit[split_indices] = False
 
@@ -1003,7 +1021,7 @@ def prune_overlapping_gaussians(
             base_gaussian._rotation = torch.nn.Parameter(torch.cat([base_gaussian._rotation.detach()[keep_unsplit], new_rot], dim=0).requires_grad_(True))
 
         if total_split_count > 0:
-            print(f"  -> デカール境界・外周のガウシアン計 {total_split_count:,} 点を 3Dガウス分布で再サンプリングしました (生成サブ点: {total_spawned_count:,} 点)")
+            print(f"  -> デカール境界・外周のガウシアン計 {total_split_count:,} 点を 2Dグリッド再サンプリングしました (生成サブ点: {total_spawned_count:,} 点)")
 
         # 3. 2D再サンプリング後の点群に対して、「面内方向はデカール輪郭の内側のみ (d_parallel <= h_nearest * 1.25)」かつ
         #    「法線方向は ±prune_margin 以内」の点のみを削除し、横方向外側の高密度サブガウシアンはエッジ直前まで残す
