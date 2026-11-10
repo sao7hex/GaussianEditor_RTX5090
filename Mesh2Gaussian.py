@@ -873,6 +873,7 @@ def refine_with_diffusion(
     refine_steps: int = 200,
     per_editing_step: int = 10,
     lr: float = 0.005,
+    output_dir: str = "Mesh2Gaussian_data/output",
 ):
     """
     GaussianEditor の InstructPix2Pix / EditGuidance を直接呼び出し、
@@ -923,13 +924,23 @@ def refine_with_diffusion(
     train_cams = scene.getTrainCameras()
     H, W = train_cams[0].image_height, train_cams[0].image_width
 
-    # 3. 各カメラ視点の基準画像を事前キャッシュ
-    print("  -> 各カメラ視点の初期レンダリング画像を事前取得中...")
+    # 3. 各カメラ視点の基準画像を事前キャッシュ ＆ 画像ファイルとして保存
+    origin_render_dir = os.path.join(output_dir, "origin_renders")
+    os.makedirs(origin_render_dir, exist_ok=True)
+    print(f"  -> 各カメラ視点の初期レンダリング画像を事前取得・保存中 ({origin_render_dir})...")
     origin_frames = {}
     with torch.no_grad():
         for i, cam in enumerate(train_cams):
             r_pkg = render(cam, gaussian, pipe, bg_color)
-            origin_frames[i] = r_pkg["render"].detach().clone()
+            rendered_tensor = r_pkg["render"].detach().clone()
+            origin_frames[i] = rendered_tensor
+
+            # [3, H, W] (0.0~1.0) -> [H, W, 3] (0~255 uint8) に変換してPNG保存
+            img_np = (rendered_tensor.clamp(0.0, 1.0).permute(1, 2, 0).cpu().numpy() * 255.0).astype(np.uint8)
+            cam_name = getattr(cam, "image_name", None)
+            filename = f"render_cam_{i:04d}_{cam_name}.png" if cam_name else f"render_cam_{i:04d}.png"
+            Image.fromarray(img_np).save(os.path.join(origin_render_dir, filename))
+    print(f"  -> 全 {len(train_cams)} 視点の初期レンダリング画像を保存しました: {origin_render_dir}")
 
     edit_frames = {}
 
@@ -1244,6 +1255,7 @@ def main():
             refine_steps=args.refine_steps,
             per_editing_step=args.per_editing_step,
             lr=args.lr,
+            output_dir=output_dir,
         )
 
     # --------------------------------------------------------------------------
