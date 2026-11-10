@@ -872,11 +872,12 @@ def prune_overlapping_gaussians(
     cand_batch_size = 4096
     mesh_chunk_size = 32768
 
-    def compute_decomposed_dists(query_xyz: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def compute_decomposed_dists(query_xyz: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         query_xyz [Q, 3] の各点について、最近傍メッシュ点までの:
         - min_d3d: 3Dユークリッド距離
-        - d_perp: 法線方向（垂直厚み）距離 |(x - p) . n|
+        - signed_d_perp: 符号付き法線方向距離 (x - p) . n  (+が表側法線方向、-が裏側逆法線方向)
+        - d_perp: 法線方向距離の絶対値 |(x - p) . n| (+方向・-方向の両方を含む垂直距離)
         - d_parallel: 面内方向（横ズレ）距離 sqrt(|x - p|^2 - d_perp^2)
         - nearest_spacing: 最近傍メッシュ点の格子間隔 h
         を返す。
@@ -906,9 +907,11 @@ def prune_overlapping_gaussians(
         nearest_h = mesh_spacing[nearest_idx]        # [Q]
 
         diff_vec = query_xyz - nearest_pts           # [Q, 3]
-        d_perp = torch.abs((diff_vec * nearest_norms).sum(dim=1))
+        # 符号付き垂直距離 (+法線方向 と -法線方向 の両方)
+        signed_d_perp = (diff_vec * nearest_norms).sum(dim=1)
+        d_perp = torch.abs(signed_d_perp)
         d_parallel = torch.sqrt(torch.clamp(min_d3d * min_d3d - d_perp * d_perp, min=0.0))
-        return min_d3d, d_perp, d_parallel, nearest_h
+        return min_d3d, signed_d_perp, d_perp, d_parallel, nearest_h
 
     min_b, max_b = mesh_bounds
     min_b_t = torch.from_numpy(min_b).float().to(device)
@@ -938,13 +941,14 @@ def prune_overlapping_gaussians(
             if reach_indices.numel() == 0:
                 break
 
-            _, d_perp_r, d_par_r, h_r = compute_decomposed_dists(xyz_curr[reach_indices])
+            _, signed_perp_r, d_perp_r, d_par_r, h_r = compute_decomposed_dists(xyz_curr[reach_indices])
             s_max_r = s_max[reach_indices]
 
-            # デカール領域（面内: h_r * 1.15, 法線: prune_margin）に楕円体(2.0 * s_max)が差し掛かる大ガウシアンを分割
+            # デカール領域（面内: h_r * 1.8, 法線: -prune_margin 〜 +prune_margin）に楕円体が差し掛かる大ガウシアンを分割
             need_split_local = (
-                (d_par_r <= h_r * 1.15 + 2.0 * s_max_r) &
-                (d_perp_r <= prune_margin + 2.0 * s_max_r)
+                (d_par_r <= h_r * 1.8 + 2.0 * s_max_r) &
+                (signed_perp_r >= -(prune_margin + 2.0 * s_max_r)) &
+                (signed_perp_r <= +(prune_margin + 2.0 * s_max_r))
             )
             split_indices = reach_indices[need_split_local]
             num_to_split = split_indices.numel()
@@ -1022,12 +1026,13 @@ def prune_overlapping_gaussians(
                 base_gaussian._generation = torch.zeros(N, dtype=torch.int64, device=device)
             return 0
 
-        _, d_perp, d_parallel, h_nearest = compute_decomposed_dists(xyz[candidate_indices])
+        _, signed_d_perp, d_perp, d_parallel, h_nearest = compute_decomposed_dists(xyz[candidate_indices])
 
-        # 横方向(d_parallel)はデカール点間隔(h_nearest * 1.15)以内に厳密制限し、外周の下地ガウシアンは一切削らない
-        in_decal_footprint = d_parallel <= torch.clamp(h_nearest * 1.15, min=0.0005)
-        in_normal_thickness = d_perp <= prune_margin
-        prune_mask_cand = in_decal_footprint & in_normal_thickness
+        # 横方向(d_parallel)はデカール格子間隔(h_nearest * 1.8)以内に制限し、外周の空白溝を防止
+        # 垂直方向(signed_d_perp)は +prune_margin (表側・正方向) と -prune_margin (裏側・負方向) の両方向とも削除
+        in_decal_footprint = d_parallel <= torch.clamp(h_nearest * 1.8, min=0.001)
+        in_normal_both_dirs = (signed_d_perp >= -prune_margin) & (signed_d_perp <= +prune_margin)
+        prune_mask_cand = in_decal_footprint & in_normal_both_dirs
 
         pruned_indices = candidate_indices[prune_mask_cand]
         num_pruned = pruned_indices.shape[0]
