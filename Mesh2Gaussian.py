@@ -383,6 +383,7 @@ def sample_mesh_with_texture_and_priority(
     priorities = np.concatenate(all_priorities, axis=0).astype(np.int32)
 
     # 座標系補正 (COLMAP系 OpenCV: Y-Down, Z-Forward vs glTF OpenGL: Y-Up, -Z Forward)
+    # 元のメッシュがすでにOpenCVように対応させているため，通常なら必要なし
     if rotate_x != 0.0 or rotate_y != 0.0 or rotate_z != 0.0:
         points = apply_euler_rotation(points, rotate_x, rotate_y, rotate_z)
         log(f"  -> [座標系補正] メッシュ点群に回転補正を適用: X={rotate_x}°, Y={rotate_y}°, Z={rotate_z}°")
