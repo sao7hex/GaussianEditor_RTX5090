@@ -678,12 +678,13 @@ def prune_overlapping_gaussians(
     prune_margin: float = 0.02,
     depth_tolerance: float = 0.005,
     max_cams_to_check: int = 10,
+    mesh_gaussian: Optional[VanillaGaussianModel] = None,
 ) -> int:
     """
-    配置されたメッシュのバウンディングボックスおよびColmapカメラからのZバッファ・マスク判定に基づき、
-    メッシュの内包または真後ろに隠れる既存の不要ガウシアン点群を自動検出して削除する。
+    2Dマスク投影を使わず、配置されたメッシュ点群との「3D空間での最短距離（3D最近傍距離）」に基づき、
+    メッシュ表面から prune_margin 以内に重なっている既存ガウシアン点群のみをピンポイントで自動検出して削除する。
     """
-    print(f"\n[Step 4: Auto-Prune] メッシュと重複・遮蔽される既存ガウシアンの自動検出を開始...")
+    print(f"\n[Step 4: Auto-Prune] 3D最近傍距離に基づき、メッシュと重複する既存ガウシアンの自動検出を開始 (閾値: {prune_margin})...")
     xyz = base_gaussian.get_xyz  # [N, 3]
     N = xyz.shape[0]
 
@@ -705,45 +706,41 @@ def prune_overlapping_gaussians(
     if cand_count == 0:
         return 0
 
-    cand_xyz = xyz[candidate_indices]  # [M, 3]
+    # 2. 追加メッシュの3D点群座標を取得 (オクルーダーではない実体メッシュの点群のみ)
+    if mesh_gaussian is not None and mesh_gaussian.get_xyz.shape[0] > 0:
+        mesh_xyz = mesh_gaussian.get_xyz.detach()
+    else:
+        layer_xyz_list = [
+            sub_gs.get_xyz.detach()
+            for layers in render_layers_by_idx.values()
+            for sub_gs, is_occluder in layers
+            if not is_occluder and sub_gs.get_xyz.shape[0] > 0
+        ]
+        if len(layer_xyz_list) == 0:
+            return 0
+        mesh_xyz = torch.cat(layer_xyz_list, dim=0)
+
+    cand_xyz = xyz[candidate_indices].detach()  # [M, 3]
     prune_mask_cand = torch.zeros(cand_count, dtype=torch.bool, device=xyz.device)
 
-    # 2. 代表カメラ視点から見て、メッシュのテクスチャ領域で遮蔽されているかを判定
-    step = max(1, len(cameras) // max_cams_to_check)
-    cams_to_check = cameras[::step][:max_cams_to_check]
+    # 3. GPUチャンク処理による3D空間での最短距離 (最近傍距離) 判定
+    #    VRAM消費を抑えつつ高速計算するため、候補点とメッシュ点をチャンク分割して torch.cdist で3D距離を計算
+    cand_batch_size = 4096
+    mesh_chunk_size = 32768
+    M_mesh = mesh_xyz.shape[0]
 
     with torch.no_grad():
-        for cam in cams_to_check:
-            mesh_mask_buf, _ = render_mesh_silhouette_mask_with_zbuffer(
-                render_layers_by_idx=render_layers_by_idx,
-                cam=cam,
-                pipe=pipe,
-                depth_tolerance=depth_tolerance,
-            )
-            if not torch.any(mesh_mask_buf):
-                continue
+        for i in range(0, cand_count, cand_batch_size):
+            c_batch = cand_xyz[i : i + cand_batch_size]  # [B, 3]
+            min_dists = torch.full((c_batch.shape[0],), float("inf"), dtype=torch.float32, device=xyz.device)
 
-            R = torch.from_numpy(cam.R).float().to(xyz.device)
-            T = torch.from_numpy(cam.T).float().to(xyz.device)
-            cand_cam = torch.matmul(cand_xyz, R) + T
-            z_cam = cand_cam[:, 2]
+            for j in range(0, M_mesh, mesh_chunk_size):
+                m_chunk = mesh_xyz[j : j + mesh_chunk_size]  # [K, 3]
+                dists = torch.cdist(c_batch, m_chunk, p=2.0)  # [B, K]
+                chunk_min = dists.min(dim=1)[0]
+                min_dists = torch.minimum(min_dists, chunk_min)
 
-            valid_z = z_cam > 0.05
-            fx = cam.image_width / (2.0 * np.tan(cam.FoVx / 2.0))
-            fy = cam.image_height / (2.0 * np.tan(cam.FoVy / 2.0))
-            cx = cam.image_width / 2.0
-            cy = cam.image_height / 2.0
-
-            u = (cand_cam[:, 0] * fx / z_cam + cx).long()
-            v = (cand_cam[:, 1] * fy / z_cam + cy).long()
-
-            in_screen = valid_z & (u >= 0) & (u < cam.image_width) & (v >= 0) & (v < cam.image_height)
-            u_valid = torch.clamp(u, 0, cam.image_width - 1)
-            v_valid = torch.clamp(v, 0, cam.image_height - 1)
-            hit_mesh_mask = mesh_mask_buf[v_valid, u_valid]
-
-            # メッシュマスク領域に隠れる既存点をマーク
-            prune_mask_cand |= (in_screen & hit_mesh_mask)
+            prune_mask_cand[i : i + cand_batch_size] = (min_dists <= prune_margin)
 
     pruned_indices = candidate_indices[prune_mask_cand]
     num_pruned = pruned_indices.shape[0]
@@ -1132,6 +1129,7 @@ def main():
             mesh_bounds=mesh_bounds,
             prune_margin=args.prune_margin,
             depth_tolerance=args.depth_tolerance,
+            mesh_gaussian=full_gaussian,
         )
 
     # --------------------------------------------------------------------------
