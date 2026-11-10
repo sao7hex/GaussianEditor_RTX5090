@@ -42,6 +42,7 @@ from gaussiansplatting.scene import Scene
 from gaussiansplatting.arguments import ModelParams, PipelineParams
 from gaussiansplatting.gaussian_renderer import render
 from gaussiansplatting.utils.graphics_utils import BasicPointCloud
+from gaussiansplatting.utils.general_utils import build_rotation
 
 
 # ==============================================================================
@@ -679,34 +680,19 @@ def prune_overlapping_gaussians(
     depth_tolerance: float = 0.005,
     max_cams_to_check: int = 10,
     mesh_gaussian: Optional[VanillaGaussianModel] = None,
+    max_split_passes: int = 3,
 ) -> int:
     """
-    2Dマスク投影を使わず、配置されたメッシュ点群との「3D空間での最短距離（3D最近傍距離）」に基づき、
-    メッシュ表面から prune_margin 以内に重なっている既存ガウシアン点群のみをピンポイントで自動検出して削除する。
+    【解決策2: 大きいガウシアンの自動分割(Split) ＋ 3D最近傍距離によるピンポイント削除】
+    1. メッシュ近傍にかかっている「スケールの大きい既存ガウシアン」をそのまま消すと周囲に穴が空くため、
+       まず長軸方向に沿って小さなガウシアンへ段階的に分割 (Subdivide) する。
+    2. 分割後、メッシュ点群との「3D空間での最短距離（3D最近傍距離）」が prune_margin 以内の点だけを削除し、
+       メッシュ外にはみ出していた片割れ（周囲の下地）はそのまま残すことで見た目の破綻を防ぐ。
     """
-    print(f"\n[Step 4: Auto-Prune] 3D最近傍距離に基づき、メッシュと重複する既存ガウシアンの自動検出を開始 (閾値: {prune_margin})...")
-    xyz = base_gaussian.get_xyz  # [N, 3]
-    N = xyz.shape[0]
+    print(f"\n[Step 4: Auto-Prune] 大スケールガウシアンの自動分割 ＆ 3D最近傍距離くり抜きを開始 (閾値: {prune_margin})...")
+    device = base_gaussian.get_xyz.device
 
-    min_b, max_b = mesh_bounds
-    # 1. 3Dバウンディングボックスによる粗選抜 (GPUテンソルで高速判定)
-    margin_vec = torch.tensor(prune_margin, device=xyz.device)
-    min_b_t = torch.from_numpy(min_b).float().to(xyz.device) - margin_vec
-    max_b_t = torch.from_numpy(max_b).float().to(xyz.device) + margin_vec
-
-    in_bbox = (
-        (xyz[:, 0] >= min_b_t[0]) & (xyz[:, 0] <= max_b_t[0]) &
-        (xyz[:, 1] >= min_b_t[1]) & (xyz[:, 1] <= max_b_t[1]) &
-        (xyz[:, 2] >= min_b_t[2]) & (xyz[:, 2] <= max_b_t[2])
-    )
-
-    candidate_indices = torch.where(in_bbox)[0]
-    cand_count = candidate_indices.shape[0]
-    print(f"  -> メッシュAABB近傍の候補点数: {cand_count:,} / {N:,} 点")
-    if cand_count == 0:
-        return 0
-
-    # 2. 追加メッシュの3D点群座標を取得 (オクルーダーではない実体メッシュの点群のみ)
+    # 1. 追加メッシュの3D点群座標を取得 (オクルーダーではない実体メッシュの点群のみ)
     if mesh_gaussian is not None and mesh_gaussian.get_xyz.shape[0] > 0:
         mesh_xyz = mesh_gaussian.get_xyz.detach()
     else:
@@ -720,57 +706,158 @@ def prune_overlapping_gaussians(
             return 0
         mesh_xyz = torch.cat(layer_xyz_list, dim=0)
 
-    cand_xyz = xyz[candidate_indices].detach()  # [M, 3]
-    prune_mask_cand = torch.zeros(cand_count, dtype=torch.bool, device=xyz.device)
-
-    # 3. GPUチャンク処理による3D空間での最短距離 (最近傍距離) 判定
-    #    VRAM消費を抑えつつ高速計算するため、候補点とメッシュ点をチャンク分割して torch.cdist で3D距離を計算
+    M_mesh = mesh_xyz.shape[0]
     cand_batch_size = 4096
     mesh_chunk_size = 32768
-    M_mesh = mesh_xyz.shape[0]
+
+    def compute_min_dists_to_mesh(query_xyz: torch.Tensor) -> torch.Tensor:
+        """query_xyz [Q, 3] の各点から mesh_xyz [M_mesh, 3] までの3D最短距離を計算する"""
+        q_count = query_xyz.shape[0]
+        out_dists = torch.full((q_count,), float("inf"), dtype=torch.float32, device=device)
+        for i in range(0, q_count, cand_batch_size):
+            c_batch = query_xyz[i : i + cand_batch_size]
+            batch_min = torch.full((c_batch.shape[0],), float("inf"), dtype=torch.float32, device=device)
+            for j in range(0, M_mesh, mesh_chunk_size):
+                m_chunk = mesh_xyz[j : j + mesh_chunk_size]
+                dists = torch.cdist(c_batch, m_chunk, p=2.0)
+                batch_min = torch.minimum(batch_min, dists.min(dim=1)[0])
+            out_dists[i : i + cand_batch_size] = batch_min
+        return out_dists
+
+    min_b, max_b = mesh_bounds
+    min_b_t = torch.from_numpy(min_b).float().to(device)
+    max_b_t = torch.from_numpy(max_b).float().to(device)
+
+    # 2. メッシュ近傍にかかっている「大きいガウシアン」を長軸方向に沿って段階的に2分割 (最大 max_split_passes 回)
+    split_scale_thresh = max(prune_margin * 0.5, 0.002)
+    total_split_count = 0
 
     with torch.no_grad():
-        for i in range(0, cand_count, cand_batch_size):
-            c_batch = cand_xyz[i : i + cand_batch_size]  # [B, 3]
-            min_dists = torch.full((c_batch.shape[0],), float("inf"), dtype=torch.float32, device=xyz.device)
+        for pass_idx in range(max_split_passes):
+            xyz_curr = base_gaussian.get_xyz.detach()
+            scales_curr = base_gaussian.get_scaling.detach()  # 実空間での3軸スケール [N, 3]
+            s_max, max_axis = scales_curr.max(dim=1)          # 最大軸の長さと軸インデックス (0, 1, 2)
 
-            for j in range(0, M_mesh, mesh_chunk_size):
-                m_chunk = mesh_xyz[j : j + mesh_chunk_size]  # [K, 3]
-                dists = torch.cdist(c_batch, m_chunk, p=2.0)  # [B, K]
-                chunk_min = dists.min(dim=1)[0]
-                min_dists = torch.minimum(min_dists, chunk_min)
+            # ガウシアンの楕円体がメッシュAABBに届き得る範囲 (prune_margin + 2.5 * s_max) で粗選抜
+            reach = prune_margin + 2.5 * s_max
+            in_reach_bbox = (
+                (s_max > split_scale_thresh) &
+                (xyz_curr[:, 0] >= min_b_t[0] - reach) & (xyz_curr[:, 0] <= max_b_t[0] + reach) &
+                (xyz_curr[:, 1] >= min_b_t[1] - reach) & (xyz_curr[:, 1] <= max_b_t[1] + reach) &
+                (xyz_curr[:, 2] >= min_b_t[2] - reach) & (xyz_curr[:, 2] <= max_b_t[2] + reach)
+            )
 
-            prune_mask_cand[i : i + cand_batch_size] = (min_dists <= prune_margin)
+            reach_indices = torch.where(in_reach_bbox)[0]
+            if reach_indices.numel() == 0:
+                break
 
-    pruned_indices = candidate_indices[prune_mask_cand]
-    num_pruned = pruned_indices.shape[0]
+            # メッシュ点群までの最短距離が「prune_margin + 2.0 * s_max」以内の大ガウシアンのみ分割対象とする
+            d_reach = compute_min_dists_to_mesh(xyz_curr[reach_indices])
+            need_split_local = d_reach <= (prune_margin + 2.0 * s_max[reach_indices])
+            split_indices = reach_indices[need_split_local]
+            num_to_split = split_indices.numel()
 
-    if num_pruned > 0:
-        full_prune_mask = torch.zeros(N, dtype=torch.bool, device=xyz.device)
-        full_prune_mask[pruned_indices] = True
-        keep_mask = ~full_prune_mask
+            if num_to_split == 0:
+                break
 
-        with torch.no_grad():
-            base_gaussian._xyz = torch.nn.Parameter(base_gaussian._xyz[keep_mask].requires_grad_(True))
-            base_gaussian._features_dc = torch.nn.Parameter(base_gaussian._features_dc[keep_mask].requires_grad_(True))
-            base_gaussian._features_rest = torch.nn.Parameter(base_gaussian._features_rest[keep_mask].requires_grad_(True))
-            base_gaussian._opacity = torch.nn.Parameter(base_gaussian._opacity[keep_mask].requires_grad_(True))
-            base_gaussian._scaling = torch.nn.Parameter(base_gaussian._scaling[keep_mask].requires_grad_(True))
-            base_gaussian._rotation = torch.nn.Parameter(base_gaussian._rotation[keep_mask].requires_grad_(True))
-            if hasattr(base_gaussian, "max_radii2D") and base_gaussian.max_radii2D is not None:
-                if len(base_gaussian.max_radii2D) == N:
-                    base_gaussian.max_radii2D = base_gaussian.max_radii2D[keep_mask]
-                else:
-                    base_gaussian.max_radii2D = torch.zeros(base_gaussian.get_xyz.shape[0], device=xyz.device)
-            if hasattr(base_gaussian, "_generation") and base_gaussian._generation is not None:
-                if len(base_gaussian._generation) == N:
-                    base_gaussian._generation = base_gaussian._generation[keep_mask]
-                else:
-                    base_gaussian._generation = torch.zeros(base_gaussian.get_xyz.shape[0], dtype=torch.int64, device=xyz.device)
+            total_split_count += num_to_split
 
-        print(f"  -> 遮蔽・重複していた既存ガウシアン {num_pruned:,} 点を自動削除しました！ (残存: {base_gaussian.get_xyz.shape[0]:,} 点)")
-    else:
-        print(f"  -> 削除対象となる重複ガウシアンはありませんでした。")
+            # 分割対象のパラメータを取得
+            xyz_sp = base_gaussian._xyz.detach()[split_indices]
+            f_dc_sp = base_gaussian._features_dc.detach()[split_indices]
+            f_rest_sp = base_gaussian._features_rest.detach()[split_indices]
+            opac_sp = base_gaussian._opacity.detach()[split_indices]
+            rot_sp = base_gaussian._rotation.detach()[split_indices]
+            scales_sp = scales_curr[split_indices]
+            s_max_sp = s_max[split_indices]
+            axis_sp = max_axis[split_indices]
+
+            # クォータニオンから回転行列 [M, 3, 3] を求め、最大スケール軸のワールド方向ベクトルを取得
+            rots_mat = build_rotation(rot_sp)  # [M, 3, 3]
+            arange_m = torch.arange(num_to_split, device=device)
+            principal_dir = rots_mat[arange_m, :, axis_sp]  # [M, 3]
+
+            # 長軸方向に ±0.5 * s_max ずらした2つの子ガウシアンを生成
+            offset = 0.5 * s_max_sp[:, None] * principal_dir
+            new_xyz = torch.cat([xyz_sp - offset, xyz_sp + offset], dim=0)
+
+            # 分割した軸のスケールを 1 / 1.6 (3DGS標準の 0.8 * N) に縮小し、他2軸は維持
+            new_scales_linear = scales_sp.clone()
+            new_scales_linear[arange_m, axis_sp] /= 1.6
+            new_scaling_single = base_gaussian.scaling_inverse_activation(new_scales_linear)
+            new_scaling = torch.cat([new_scaling_single, new_scaling_single], dim=0)
+
+            new_f_dc = torch.cat([f_dc_sp, f_dc_sp], dim=0)
+            new_f_rest = torch.cat([f_rest_sp, f_rest_sp], dim=0)
+            new_opac = torch.cat([opac_sp, opac_sp], dim=0)
+            new_rot = torch.cat([rot_sp, rot_sp], dim=0)
+
+            # 元の大きい親ガウシアンを除外し、分割後の2つの子ガウシアンを追加
+            keep_unsplit = torch.ones(xyz_curr.shape[0], dtype=torch.bool, device=device)
+            keep_unsplit[split_indices] = False
+
+            base_gaussian._xyz = torch.nn.Parameter(torch.cat([base_gaussian._xyz.detach()[keep_unsplit], new_xyz], dim=0).requires_grad_(True))
+            base_gaussian._features_dc = torch.nn.Parameter(torch.cat([base_gaussian._features_dc.detach()[keep_unsplit], new_f_dc], dim=0).requires_grad_(True))
+            base_gaussian._features_rest = torch.nn.Parameter(torch.cat([base_gaussian._features_rest.detach()[keep_unsplit], new_f_rest], dim=0).requires_grad_(True))
+            base_gaussian._opacity = torch.nn.Parameter(torch.cat([base_gaussian._opacity.detach()[keep_unsplit], new_opac], dim=0).requires_grad_(True))
+            base_gaussian._scaling = torch.nn.Parameter(torch.cat([base_gaussian._scaling.detach()[keep_unsplit], new_scaling], dim=0).requires_grad_(True))
+            base_gaussian._rotation = torch.nn.Parameter(torch.cat([base_gaussian._rotation.detach()[keep_unsplit], new_rot], dim=0).requires_grad_(True))
+
+        if total_split_count > 0:
+            print(f"  -> メッシュ境界付近の大きいガウシアン計 {total_split_count:,} 点を細分割しました (欠損防止)")
+
+        # 3. 細分割後の点群に対して、メッシュ表面から prune_margin 以内の点のみをピンポイント削除
+        xyz = base_gaussian.get_xyz.detach()
+        N = xyz.shape[0]
+        margin_vec = torch.tensor(prune_margin, device=device)
+        min_b_p = min_b_t - margin_vec
+        max_b_p = max_b_t + margin_vec
+
+        in_bbox = (
+            (xyz[:, 0] >= min_b_p[0]) & (xyz[:, 0] <= max_b_p[0]) &
+            (xyz[:, 1] >= min_b_p[1]) & (xyz[:, 1] <= max_b_p[1]) &
+            (xyz[:, 2] >= min_b_p[2]) & (xyz[:, 2] <= max_b_p[2])
+        )
+
+        candidate_indices = torch.where(in_bbox)[0]
+        cand_count = candidate_indices.shape[0]
+        print(f"  -> メッシュAABB近傍の最終候補点数: {cand_count:,} / {N:,} 点")
+        if cand_count == 0:
+            # 補助バッファを同期して終了
+            if hasattr(base_gaussian, "max_radii2D"):
+                base_gaussian.max_radii2D = torch.zeros(N, device=device)
+            if hasattr(base_gaussian, "_generation"):
+                base_gaussian._generation = torch.zeros(N, dtype=torch.int64, device=device)
+            return 0
+
+        min_dists = compute_min_dists_to_mesh(xyz[candidate_indices])
+        prune_mask_cand = (min_dists <= prune_margin)
+
+        pruned_indices = candidate_indices[prune_mask_cand]
+        num_pruned = pruned_indices.shape[0]
+
+        if num_pruned > 0:
+            full_prune_mask = torch.zeros(N, dtype=torch.bool, device=device)
+            full_prune_mask[pruned_indices] = True
+            keep_mask = ~full_prune_mask
+
+            base_gaussian._xyz = torch.nn.Parameter(base_gaussian._xyz.detach()[keep_mask].requires_grad_(True))
+            base_gaussian._features_dc = torch.nn.Parameter(base_gaussian._features_dc.detach()[keep_mask].requires_grad_(True))
+            base_gaussian._features_rest = torch.nn.Parameter(base_gaussian._features_rest.detach()[keep_mask].requires_grad_(True))
+            base_gaussian._opacity = torch.nn.Parameter(base_gaussian._opacity.detach()[keep_mask].requires_grad_(True))
+            base_gaussian._scaling = torch.nn.Parameter(base_gaussian._scaling.detach()[keep_mask].requires_grad_(True))
+            base_gaussian._rotation = torch.nn.Parameter(base_gaussian._rotation.detach()[keep_mask].requires_grad_(True))
+
+            print(f"  -> メッシュと重なるガウシアン {num_pruned:,} 点を削除しました！ (残存: {base_gaussian.get_xyz.shape[0]:,} 点)")
+        else:
+            print(f"  -> 削除対象となる重複ガウシアンはありませんでした。")
+
+        # 補助バッファ (max_radii2D / _generation) を現在の点数に同期
+        final_n = base_gaussian.get_xyz.shape[0]
+        if hasattr(base_gaussian, "max_radii2D"):
+            base_gaussian.max_radii2D = torch.zeros(final_n, device=device)
+        if hasattr(base_gaussian, "_generation"):
+            base_gaussian._generation = torch.zeros(final_n, dtype=torch.int64, device=device)
 
     return num_pruned
 
