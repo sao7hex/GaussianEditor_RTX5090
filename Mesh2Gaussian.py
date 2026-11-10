@@ -10,15 +10,14 @@ Blenderなどの3Dソフトウェア上で既存シーンの点群に合わせ�
 1. GLBファイルに内包されている「本来のテクスチャ画像 (baseColorTexture)」と「UV座標」から
    正確なカラー（RGB）をサンプリングし、頂点座標を維持したままガウシアン化。
 2. 【オクルーダー遮蔽のインテリジェント制御】
-   ・「除外メッシュ（末尾メッシュ）およびテクスチャが存在しないメッシュモデル（遮蔽物パーツ）」:
-       シーン統合からは除外しつつオクルーダーとしてガウシアン化し、2Dシルエットマスク生成時に描画。
-       マスク領域からは外し（黒: False）、手前にある場合は裏側にあるメッシュをマスク領域から遮蔽・除外。
+   ・「テクスチャが存在しないメッシュモデル（遮蔽物パーツ）」:
+       オクルーダーとして機能し、手前にある場合は奥のテクスチャをマスクから遮蔽・除外。
    ・「テクスチャが存在するメッシュモデル内のテクスチャがない領域（デカールの余白・透明部分など）」:
        オクルーダー遮断は一切行わず、完全透過（スルー）して奥のレイヤーを描画。
 3. 【内部Zバッファ合成方式によるZ-fighting解消】
    3D座標は1ミリも動かさず、PyTorch上で内部的なZバッファ（深度バッファテスト）を管理。
    同一平面上の重なりポリゴンでは「最大インデックス番号のメッシュ」を優先して手前として判定。
-4. 座標系自動補正: COLMAP座標系 (Y-Down, Z-Forward) と glTF規格 (Y-Up, -Z Forward) の不一致を解消するため、必要に応じて回転補正を適用可能。GaussianModel.concat_gaussians で直接結合してPLY保存。
+4. 座標系自動補正: COLMAP座標系 (Y-Down, Z-Forward) と glTF規格 (Y-Up, -Z Forward) の不一致を解消するため、デフォルトでX軸180度回転 (--rotate_x 180.0) を自動適用して既存シーンと完全整合。GaussianModel.concat_gaussians で直接結合してPLY保存。
 """
 
 import os
@@ -101,6 +100,8 @@ def split_submeshes_by_material(mesh: trimesh.Trimesh, base_idx: int) -> List[Tu
         pass
 
     return [(mesh, base_idx)]
+
+
 
 
 # ==============================================================================
@@ -186,6 +187,7 @@ def sample_colors_from_submesh(
     return np.full((n_pts, 3), default_color, dtype=np.float32), has_tex_mask
 
 
+
 def apply_euler_rotation(points: np.ndarray, rx_deg: float, ry_deg: float, rz_deg: float) -> np.ndarray:
     """
     点群に対してオイラー角 (度) による3軸回転を適用する。
@@ -234,12 +236,12 @@ def sample_mesh_with_texture_and_priority(
     rotate_y: float = 0.0,
     rotate_z: float = 0.0,
     mesh_log_path: Optional[str] = None,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    GLBメッシュを読み込み、サンプリングを行う。
-    ・シーン統合対象メッシュ (末尾以外かつテクスチャあり) -> points, colors, priorities
-    ・除外メッシュ (末尾メッシュおよびテクスチャなしメッシュ) -> occluder_points, occluder_priorities
-      (シーンには結合せず、2Dシルエットマスク生成時の遮蔽用オクルーダーとしてのみガウシアン化して描画する)
+    GLBメッシュを読み込み、一番最後のメッシュを除外した上でサンプリングを行う。
+    points, colors, priorities を返す。
+    デフォルトでは回転補正なし (rotate_x=0.0)。必要に応じてオイラー角を適用可能。
+    mesh_log_path が指定されている場合、メッシュ一覧とサンプリング結果をログファイルに保存する。
     """
     loaded = trimesh.load(mesh_path, process=False)
 
@@ -257,7 +259,6 @@ def sample_mesh_with_texture_and_priority(
         log_lines.append(msg)
 
     indexed_submeshes = []
-    excluded_submeshes = []
     if isinstance(loaded, trimesh.Scene):
         parents_map = getattr(loaded.graph.transforms, "parents", {})
         base_frame = loaded.graph.base_frame
@@ -268,7 +269,7 @@ def sample_mesh_with_texture_and_priority(
             geom_name = loaded.graph.transforms.node_data.get(node_name, {}).get("geometry", None)
             if geom_name is None and node_name in loaded.geometry:
                 geom_name = node_name
-            if geom_name is not None and node_name in loaded.geometry:
+            if geom_name is not None and geom_name in loaded.geometry:
                 nodes_with_mesh.append((default_idx, node_name, geom_name))
 
         # node_data から取得できなかった場合は geometry.items() をフォールバック利用
@@ -292,6 +293,13 @@ def sample_mesh_with_texture_and_priority(
             geom = loaded.geometry[geom_name]
             mesh_idx = extract_mesh_index(node_name, default_idx)
 
+            # ★ GLB内で一番最後（末尾 = mesh_count == total_valid - 1）に出現するメッシュを除外！
+            if total_valid > 1 and mesh_count == total_valid - 1:
+                log(f"     [除外] ★ 最後のメッシュ（#{mesh_count}）をスキップ: ノード='{node_name}', ジオメトリ='{geom_name}' (頂点数: {len(geom.vertices):,})")
+                continue
+
+            log(f"     [採用] メッシュ #{mesh_count}: ノード='{node_name}', ジオメトリ='{geom_name}' (Index: {mesh_idx}, 頂点数: {len(geom.vertices):,})")
+
             # 親ノードの取得と階層行列の合成計算 (T_parent_world @ T_child_local)
             parent_node = parents_map.get(node_name, base_frame)
             try:
@@ -307,15 +315,6 @@ def sample_mesh_with_texture_and_priority(
 
             geom_transformed = geom.copy()
             geom_transformed.apply_transform(transform)
-
-            # ★ GLB内で一番最後（末尾 = mesh_count == total_valid - 1）に出現するメッシュは
-            #   シーン統合からは除外し、2Dマスク生成時の遮蔽用（オクルーダー）として保持する
-            if total_valid > 1 and mesh_count == total_valid - 1:
-                log(f"     [遮蔽用オクルーダー] ★ 最後のメッシュ（#{mesh_count}）をシーン統合から除外しマスク遮蔽用に保持: ノード='{node_name}', ジオメトリ='{geom_name}' (Index: {mesh_idx}, 頂点数: {len(geom.vertices):,})")
-                excluded_submeshes.append((geom_transformed, mesh_idx, node_name))
-                continue
-
-            log(f"     [採用] メッシュ #{mesh_count}: ノード='{node_name}', ジオメトリ='{geom_name}' (Index: {mesh_idx}, 頂点数: {len(geom.vertices):,})")
             indexed_submeshes.append((geom_transformed, mesh_idx, node_name))
     elif isinstance(loaded, trimesh.Trimesh):
         # 単一メッシュしかない場合は警告しつつ保持
@@ -349,9 +348,6 @@ def sample_mesh_with_texture_and_priority(
     all_colors = []
     all_priorities = []
 
-    occluder_points_list = []
-    occluder_priorities_list = []
-
     log(f"\n  -> 各メッシュへのサンプリング点数割り当て結果 (合計: {num_points:,} 点):")
     for (mesh, p_idx, name), count in zip(final_submeshes, sub_counts):
         if count <= 0:
@@ -363,11 +359,9 @@ def sample_mesh_with_texture_and_priority(
         pts, face_indices = trimesh.sample.sample_surface(mesh, count)
         cols, has_tex_mask = sample_colors_from_submesh(mesh, pts, face_indices)
 
-        # テクスチャが存在しないメッシュはシーン統合から除外し、2Dマスク生成時の遮蔽用オクルーダーとして追加
+        # テクスチャが存在しない点（テクスチャなしメッシュ、UV未展開面、透過領域など）にはガウシアンを生成しない
         if not np.any(has_tex_mask):
-            log(f"     [遮蔽用オクルーダー] テクスチャが存在しないためシーン統合からは除外し、マスク遮蔽用としてガウシアン化: ノード='{name}' ({len(pts):,} 点)")
-            occluder_points_list.append(pts.astype(np.float32))
-            occluder_priorities_list.append(np.full(len(pts), p_idx, dtype=np.int32))
+            log(f"     [スキップ] テクスチャが存在しないためガウシアン生成を除外: ノード='{name}'")
             continue
 
         valid_pts = pts[has_tex_mask]
@@ -381,26 +375,6 @@ def sample_mesh_with_texture_and_priority(
         all_colors.append(valid_cols)
         all_priorities.append(valid_priorities)
 
-    # 除外された末尾メッシュ等を2Dシルエットマスク遮蔽用（オクルーダー）としてサンプリング
-    if len(excluded_submeshes) > 0:
-        occ_areas = np.array([max(m[0].area, 1e-9) for m in excluded_submeshes], dtype=np.float64)
-        occ_weights = occ_areas / np.sum(occ_areas)
-        occ_min_guarantee = min(1000, max(100, num_points // (len(excluded_submeshes) * 5)))
-        occ_raw_counts = np.round(occ_weights * (num_points - occ_min_guarantee * len(excluded_submeshes))).astype(int)
-        occ_sub_counts = np.maximum(occ_raw_counts + occ_min_guarantee, occ_min_guarantee)
-        occ_diff = num_points - np.sum(occ_sub_counts)
-        if occ_diff != 0:
-            occ_sub_counts[np.argmax(occ_areas)] += occ_diff
-
-        log(f"\n  -> 除外メッシュ（2Dマスク遮蔽用オクルーダー）のサンプリング (合計: {num_points:,} 点):")
-        for (occ_mesh, occ_idx, occ_name), occ_count in zip(excluded_submeshes, occ_sub_counts):
-            if occ_count <= 0:
-                continue
-            occ_pts, _ = trimesh.sample.sample_surface(occ_mesh, occ_count)
-            occluder_points_list.append(occ_pts.astype(np.float32))
-            occluder_priorities_list.append(np.full(len(occ_pts), occ_idx, dtype=np.int32))
-            log(f"     ・遮蔽用ノード='{occ_name}' (Index: {occ_idx}, 表面積: {occ_mesh.area:.5f}): {len(occ_pts):,} 点をサンプリング")
-
     if len(all_points) == 0:
         raise ValueError("テクスチャを持つ有効な点群が見つかりませんでした（すべての点にテクスチャが存在しないか透明です）。")
 
@@ -408,24 +382,15 @@ def sample_mesh_with_texture_and_priority(
     colors = np.concatenate(all_colors, axis=0).astype(np.float32)
     priorities = np.concatenate(all_priorities, axis=0).astype(np.int32)
 
-    if len(occluder_points_list) > 0:
-        occluder_points = np.concatenate(occluder_points_list, axis=0).astype(np.float32)
-        occluder_priorities = np.concatenate(occluder_priorities_list, axis=0).astype(np.int32)
-    else:
-        occluder_points = np.empty((0, 3), dtype=np.float32)
-        occluder_priorities = np.empty((0,), dtype=np.int32)
-
     # 座標系補正 (COLMAP系 OpenCV: Y-Down, Z-Forward vs glTF OpenGL: Y-Up, -Z Forward)
     # 元のメッシュがすでにOpenCVように対応させているため，通常なら必要なし
     if rotate_x != 0.0 or rotate_y != 0.0 or rotate_z != 0.0:
         points = apply_euler_rotation(points, rotate_x, rotate_y, rotate_z)
-        if len(occluder_points) > 0:
-            occluder_points = apply_euler_rotation(occluder_points, rotate_x, rotate_y, rotate_z)
         log(f"  -> [座標系補正] メッシュ点群に回転補正を適用: X={rotate_x}°, Y={rotate_y}°, Z={rotate_z}°")
 
     unique_priorities = np.unique(priorities)
-    log(f"  -> 検出されたマスク対象メッシュインデックス一覧: {unique_priorities.tolist()} (最大値: {int(np.max(unique_priorities))} が最前面)")
-    log(f"  -> 点単位サンプリング内訳: シーン統合＆マスク対象 {len(points):,} 点 / マスク遮蔽専用(オクルーダー) {len(occluder_points):,} 点")
+    log(f"  -> 検出されたメッシュインデックス一覧: {unique_priorities.tolist()} (最大値: {int(np.max(unique_priorities))} が最前面)")
+    log(f"  -> 点単位サンプリング内訳: 全 {len(points):,} 点を生成")
 
     # ログファイルの保存 (output/logs/mesh_log.txt)
     if mesh_log_path:
@@ -434,7 +399,7 @@ def sample_mesh_with_texture_and_priority(
             f.write("\n".join(log_lines) + "\n")
         print(f"  -> [ログ保存] メッシュ解析ログを保存しました: {mesh_log_path}")
 
-    return points, colors, priorities, occluder_points, occluder_priorities
+    return points, colors, priorities
 
 
 def convert_mesh_to_gaussian(
@@ -448,21 +413,19 @@ def convert_mesh_to_gaussian(
     mesh_log_path: Optional[str] = None,
 ) -> Tuple[VanillaGaussianModel, Dict[int, List[Tuple[VanillaGaussianModel, bool]]], Tuple[np.ndarray, np.ndarray]]:
     """
-    GLBメッシュをガウシアン化し、以下を返す:
-    1. full_gaussian: シーン結合用の全体モデル (除外メッシュは含まない。ワールド座標をそのまま完全保持)
-    2. render_layers_by_idx: 内部Zバッファ用の {インデックス番号: [(サブガウシアン, is_occluder)]} 辞書
-       - マスク対象メッシュ: is_occluder=False (描画時にマスク領域=Trueにする)
-       - 除外メッシュ(オクルーダー): is_occluder=True (描画してZバッファを更新し、裏側を遮蔽するがマスク領域からは外す=False)
-    3. mesh_bounds: マスク対象メッシュの (min_xyz, max_xyz) バウンディングボックス
+    GLBメッシュ（一番最後のメッシュ除外済み）をガウシアン化し、以下を返す:
+    1. full_gaussian: シーン結合用の全体モデル (ワールド座標をそのまま完全保持)
+    2. render_layers_by_idx: 内部Zバッファ用の {インデックス番号: [(サブガウシアン, is_occluder=False)]} 辞書
+    3. mesh_bounds: (min_xyz, max_xyz) のバウンディングボックス
     """
-    print(f"\n[Step 1] GLBメッシュのガウシアン化を開始: {mesh_path} (除外メッシュは2Dマスク遮蔽用オクルーダーとしてガウシアン化)")
+    print(f"\n[Step 1] GLBメッシュのガウシアン化を開始: {mesh_path} (一番最後のメッシュを除外)")
     os.makedirs(os.path.dirname(os.path.abspath(output_gs_path)), exist_ok=True)
 
     # ログ出力先が指定されていない場合は output_gs_path と同階層の logs/mesh_log.txt に設定
     if mesh_log_path is None:
         mesh_log_path = os.path.join(os.path.dirname(os.path.abspath(output_gs_path)), "logs", "mesh_log.txt")
 
-    points, colors, priorities, occluder_points, occluder_priorities = sample_mesh_with_texture_and_priority(
+    points, colors, priorities = sample_mesh_with_texture_and_priority(
         mesh_path=mesh_path,
         num_points=num_points,
         rotate_x=rotate_x,
@@ -474,53 +437,32 @@ def convert_mesh_to_gaussian(
 
     mesh_bounds = (points.min(axis=0), points.max(axis=0))
 
-    # 全体モデルの初期化 (除外メッシュは含めず、座標は一切変換しない)
+    # 全体モデルの初期化 (座標は一切変換しない)
     pcd_full = BasicPointCloud(points=points, colors=colors, normals=None)
     full_gaussian = VanillaGaussianModel(sh_degree=3)
     full_gaussian.create_from_pcd(pcd_full, spatial_lr_scale=camera_extent)
     full_gaussian._opacity.data = torch.ones_like(full_gaussian._opacity.data) * 4.595  # ~0.99
     full_gaussian.save_ply(output_gs_path)
 
-    # 内部Zバッファテスト用レイヤーの構築
+    # 内部Zバッファテスト用レイヤーの構築 (オクルーダーは廃止し、すべてマスク描画対象 is_occluder=False とする)
     render_layers_by_idx: Dict[int, List[Tuple[VanillaGaussianModel, bool]]] = {}
-
-    # 1) マスク対象メッシュレイヤー (is_occluder = False)
     unique_indices = np.unique(priorities)
+    
     for idx in unique_indices:
-        idx_int = int(idx)
         idx_mask = (priorities == idx)
-        if idx_int not in render_layers_by_idx:
-            render_layers_by_idx[idx_int] = []
+        render_layers_by_idx[idx] = []
 
         pts_layer = points[idx_mask]
-        # シルエット検出時にテクスチャの暗い部分(黒に近い色)が欠けないよう、マスク描画用レイヤーは白色(1.0)で初期化
-        cols_white = np.ones_like(pts_layer, dtype=np.float32)
-        pcd_layer = BasicPointCloud(points=pts_layer, colors=cols_white, normals=None)
+        cols_layer = colors[idx_mask]
+        pcd_layer = BasicPointCloud(points=pts_layer, colors=cols_layer, normals=None)
         gs_layer = VanillaGaussianModel(sh_degree=0)
         gs_layer.create_from_pcd(pcd_layer, spatial_lr_scale=camera_extent)
         gs_layer._opacity.data = torch.ones_like(gs_layer._opacity.data) * 4.595
-        render_layers_by_idx[idx_int].append((gs_layer, False))  # is_occluder = False
-
-    # 2) 除外メッシュ（オクルーダー）レイヤー (is_occluder = True)
-    #    2Dシルエットマスク生成時に描画して裏側を遮蔽するが、マスク領域からは外す
-    if len(occluder_points) > 0:
-        unique_occ_indices = np.unique(occluder_priorities)
-        for idx in unique_occ_indices:
-            idx_int = int(idx)
-            idx_mask = (occluder_priorities == idx)
-            if idx_int not in render_layers_by_idx:
-                render_layers_by_idx[idx_int] = []
-
-            pts_occ = occluder_points[idx_mask]
-            cols_white = np.ones_like(pts_occ, dtype=np.float32)
-            pcd_occ = BasicPointCloud(points=pts_occ, colors=cols_white, normals=None)
-            gs_occ = VanillaGaussianModel(sh_degree=0)
-            gs_occ.create_from_pcd(pcd_occ, spatial_lr_scale=camera_extent)
-            gs_occ._opacity.data = torch.ones_like(gs_occ._opacity.data) * 4.595
-            render_layers_by_idx[idx_int].append((gs_occ, True))  # is_occluder = True
+        render_layers_by_idx[idx].append((gs_layer, False))  # is_occluder = False
 
     print(f"  -> ガウシアン化完了: {output_gs_path} (インデックスレイヤー数: {len(render_layers_by_idx)})")
     return full_gaussian, render_layers_by_idx, mesh_bounds
+
 
 
 # ==============================================================================
@@ -637,7 +579,7 @@ def load_base_scene(
 
 # ==============================================================================
 # 3. 【内部Zバッファ合成方式】による2Dシルエットマスク自動生成
-#    (除外メッシュ・テクスチャなしメッシュのみオクルーダー化 / テクスチャありメッシュの余白は完全透過)
+#    (テクスチャなしメッシュのみオクルーダー化 / テクスチャありメッシュの余白は完全透過)
 # ==============================================================================
 def render_mesh_silhouette_mask_with_zbuffer(
     render_layers_by_idx: Dict[int, List[Tuple[VanillaGaussianModel, bool]]],
@@ -649,14 +591,9 @@ def render_mesh_silhouette_mask_with_zbuffer(
     【内部Zバッファ合成アルゴリズム】
     ・3D座標は完全固定。
     ・インデックス昇順でレンダリング＆Zバッファ更新。
-    ・「除外メッシュ / テクスチャなしメッシュモデル (is_occluder=True)」:
-      描画してZバッファを更新するが、マスク領域からは外す (mask_buffer = False)。
-      手前にある場合は、裏側にあるマスク対象メッシュを遮蔽・除外する。
-      ただし同一平面上 (depth_tolerance以内) に貼られたデカール等のマスク対象メッシュは消さない。
-    ・「テクスチャありメッシュモデルのテクスチャ領域 (is_occluder=False)」:
-      手前または同一平面上位インデックスの場合は mask_buffer = True (白) で上書き。
-    ・「テクスチャありメッシュモデル内のテクスチャなし余白」:
-      オクルーダー遮断を行わず完全透過（奥のテクスチャをそのまま維持）。
+    ・「テクスチャなしメッシュモデル」: 手前の場合は mask_buffer = False (黒) で奥を遮蔽。
+    ・「テクスチャありメッシュモデルのテクスチャ領域」: 手前の場合は mask_buffer = True (白) で上書き。
+    ・「テクスチャありメッシュモデル内のテクスチャなし余白」: オクルーダー遮断を行わず完全透過（奥のテクスチャをそのまま維持）。
     """
     H, W = cam.image_height, cam.image_width
     bg_black = torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32, device="cuda")
@@ -676,36 +613,23 @@ def render_mesh_silhouette_mask_with_zbuffer(
                 pipe=pipe,
                 bg_color=bg_black,
             )
-
+            
             rendered_image = render_pkg["render"]
             rendered_depth = render_pkg["depth_3dgs"][0]
 
             valid_pixel = (rendered_image.max(dim=0)[0] > 0.01) & (rendered_depth > 0.001)
 
-            if is_occluder:
-                # 除外メッシュ（オクルーダー）:
-                # ・まだマスクされていない領域 (~mask_buffer) では、より手前ならZバッファを更新
-                # ・既にマスクされている領域 (mask_buffer) では、同一平面(depth_tolerance以内)のデカールを消さず、
-                #   明確に手前 (rendered_depth < z_buffer - depth_tolerance) にある場合のみ遮蔽してマスクから外す (False)
-                is_strictly_closer = rendered_depth < (z_buffer - depth_tolerance)
-                is_closer_unmasked = (~mask_buffer) & (rendered_depth < z_buffer)
-                update_pixels = valid_pixel & (is_strictly_closer | is_closer_unmasked)
+            # Zテスト (手前 または 同一平面でのインデックス優先)
+            is_closer = rendered_depth < (z_buffer - depth_tolerance)
+            is_coplanar_higher = torch.abs(rendered_depth - z_buffer) <= depth_tolerance
 
-                z_buffer[update_pixels] = rendered_depth[update_pixels]
-                mask_buffer[update_pixels] = False
-            else:
-                # マスク対象メッシュ:
-                # Zテスト (手前 または 同一平面でのインデックス優先)
-                is_closer = rendered_depth < (z_buffer - depth_tolerance)
-                is_coplanar_higher = torch.abs(rendered_depth - z_buffer) <= depth_tolerance
+            update_pixels = valid_pixel & (is_closer | is_coplanar_higher)
 
-                update_pixels = valid_pixel & (is_closer | is_coplanar_higher)
+            # Zバッファの更新
+            z_buffer[update_pixels] = rendered_depth[update_pixels]
 
-                # Zバッファの更新
-                z_buffer[update_pixels] = rendered_depth[update_pixels]
-
-                # マスク描画対象として白(True)に設定
-                mask_buffer[update_pixels] = True
+            # マスク描画対象として白(True)に設定
+            mask_buffer[update_pixels] = True
 
     mask_np = (mask_buffer.cpu().numpy() * 255).astype(np.uint8)
     mask_image = Image.fromarray(mask_np, mode="L")
@@ -999,6 +923,9 @@ def merge_and_save_scene(
 # ==============================================================================
 # メイン実行エントリポイント
 # ==============================================================================
+# ==============================================================================
+# メイン実行エントリポイント
+# ==============================================================================
 def find_mesh_file_in_dir(dir_path: str) -> Optional[str]:
     """ディレクトリ内からGLB/GLTF/OBJファイルを自動検索する"""
     if not os.path.exists(dir_path):
@@ -1136,7 +1063,7 @@ def main():
     print(f"  ・単一2Dマスク保存先 : {save_mask}")
     print(f"  ・全カメラマスク保存 : {'有効 (フォルダ: ' + multiview_mask_dir + ')' if multiview_enabled else '無効'}")
     print(f"  ・メッシュ解析ログ   : {mesh_log_path}")
-    print(f"  ・除外対象メッシュ   : 一番最後のメッシュ (末尾) ※2Dマスク生成時は遮蔽用オクルーダーとして描画")
+    print(f"  ・除外対象メッシュ   : 一番最後のメッシュ (末尾)")
     print(f"  ・不要点群自動削除   : {'有効' if auto_prune_enabled else '無効'}")
     print(f"  ・拡散モデルRefine   : {'有効 (Steps: ' + str(args.refine_steps) + ')' if refine_enabled else '無効'}")
     print("=" * 70)
@@ -1250,3 +1177,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
