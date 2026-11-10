@@ -108,6 +108,77 @@ def split_submeshes_by_material(mesh: trimesh.Trimesh, base_idx: int) -> List[Tu
 # ==============================================================================
 # 1. GLBテクスチャサンプリング & ガウシアン化
 # ==============================================================================
+def sample_surface_uniform_grid(mesh: trimesh.Trimesh, count: int) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    乱数によるバラつき（ダマや隙間）をなくし、直線や角をくっきりさせるため、
+    各三角形ポリゴン内部に規則正しい重心座標グリッド (Uniform Barycentric Grid) で点を等間隔配置する。
+    """
+    n_faces = len(mesh.faces)
+    if n_faces == 0 or count <= 0:
+        return np.empty((0, 3), dtype=np.float32), np.empty((0,), dtype=np.int64)
+
+    face_areas = np.maximum(mesh.area_faces, 1e-12)
+    face_probs = face_areas / np.sum(face_areas)
+    raw_face_counts = count * face_probs
+
+    # 各面の目標点数 c から、三角格子数 T_K = K*(K+1)/2 が c に最も近くなる解像度 K を算出
+    K_per_face = np.floor((np.sqrt(8.0 * raw_face_counts + 1.0) - 1.0) / 2.0).astype(np.int64)
+
+    # K=0 となった小面積ポリゴンにも、残りの点数枠を面積順（または確率的）に K=1 として割り当て
+    current_total = np.sum(K_per_face * (K_per_face + 1) // 2)
+    deficit = int(count - current_total)
+    if deficit > 0:
+        # 端数 (raw_face_counts - T_K) が大きい面から優先して K を +1 する
+        current_T = K_per_face * (K_per_face + 1) // 2
+        fractional_rem = raw_face_counts - current_T
+        order = np.argsort(-fractional_rem)
+        added = 0
+        for f_idx in order:
+            step_increase = int(K_per_face[f_idx] + 1)
+            if added + step_increase <= deficit * 1.15 or added == 0:
+                K_per_face[f_idx] += 1
+                added += step_increase
+            if added >= deficit:
+                break
+
+    pts_all = []
+    face_idx_all = []
+    verts = np.asarray(mesh.vertices, dtype=np.float32)
+    faces = np.asarray(mesh.faces, dtype=np.int64)
+
+    unique_Ks = np.unique(K_per_face)
+    for K in unique_Ks:
+        if K <= 0:
+            continue
+        f_ids = np.where(K_per_face == K)[0]
+        if len(f_ids) == 0:
+            continue
+
+        # 解像度 K の正則重心座標グリッド [T_K, 3] を生成
+        idx_1d = np.arange(K, dtype=np.float32)
+        ii, jj = np.meshgrid(idx_1d, idx_1d, indexing="ij")
+        valid_ij = (ii + jj) < K
+        w0 = (ii[valid_ij] + 1.0 / 3.0) / float(K)
+        w1 = (jj[valid_ij] + 1.0 / 3.0) / float(K)
+        w2 = 1.0 - w0 - w1
+        bary_K = np.stack([w0, w1, w2], axis=-1)  # [T_K, 3]
+        T_K = len(bary_K)
+
+        tri_verts = verts[faces[f_ids]]  # [M_f, 3, 3]
+        pts_K = np.einsum("tc,fcv->ftv", bary_K, tri_verts).reshape(-1, 3)
+        f_indices_K = np.repeat(f_ids, T_K)
+
+        pts_all.append(pts_K)
+        face_idx_all.append(f_indices_K)
+
+    if len(pts_all) == 0:
+        return trimesh.sample.sample_surface(mesh, count)
+
+    pts_concat = np.concatenate(pts_all, axis=0).astype(np.float32)
+    face_idx_concat = np.concatenate(face_idx_all, axis=0).astype(np.int64)
+    return pts_concat, face_idx_concat
+
+
 def sample_colors_from_submesh(
     mesh: trimesh.Trimesh,
     points: np.ndarray,
@@ -115,7 +186,8 @@ def sample_colors_from_submesh(
     default_color: Tuple[float, float, float] = (0.8, 0.8, 0.8),
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    サブメッシュから色 (RGB [0, 1]) を取得し、同時に点単位でテクスチャが存在するかのマスク (has_tex_mask) を返す。
+    サブメッシュから色 (RGB [0, 1]) をバイリニア補間で滑らかに取得し、
+    同時に点単位でテクスチャが存在するかのマスク (has_tex_mask) を返す。
     UV未展開面や透明部分は has_tex_mask = False となる。
     """
     n_pts = points.shape[0]
@@ -155,17 +227,39 @@ def sample_colors_from_submesh(
 
             u = np.clip(sampled_uvs[:, 0] % 1.0, 0.0, 1.0) * (tex_w - 1)
             v = np.clip((1.0 - (sampled_uvs[:, 1] % 1.0)), 0.0, 1.0) * (tex_h - 1)
-            u_idx = np.clip(np.round(u).astype(int), 0, tex_w - 1)
-            v_idx = np.clip(np.round(v).astype(int), 0, tex_h - 1)
-            colors = tex_np[v_idx, u_idx, :3]
+
+            # バイリニア補間 (Bilinear Interpolation) により斜め線や文字エッジのジャギーを防止
+            u0 = np.floor(u).astype(int)
+            v0 = np.floor(v).astype(int)
+            u1 = np.clip(u0 + 1, 0, tex_w - 1)
+            v1 = np.clip(v0 + 1, 0, tex_h - 1)
+            u0 = np.clip(u0, 0, tex_w - 1)
+            v0 = np.clip(v0, 0, tex_h - 1)
+
+            du = (u - u0)[:, None].astype(np.float32)
+            dv = (v - v0)[:, None].astype(np.float32)
+
+            c00 = tex_np[v0, u0]
+            c10 = tex_np[v0, u1]
+            c01 = tex_np[v1, u0]
+            c11 = tex_np[v1, u1]
+
+            c_interp = (
+                (1.0 - du) * (1.0 - dv) * c00
+                + du * (1.0 - dv) * c10
+                + (1.0 - du) * dv * c01
+                + du * dv * c11
+            )
+            colors = c_interp[:, :3]
 
             if base_factor is not None:
                 colors = colors * base_factor
 
             has_tex_mask = valid_uv & (~is_zero_uv)
             if tex_np.shape[2] >= 4:
-                alphas = tex_np[v_idx, u_idx, 3]
-                has_tex_mask = has_tex_mask & (alphas > 0.05)
+                alphas = c_interp[:, 3]
+                # 半透明の境界にじみを防ぐためアルファ閾値を 0.15 に設定
+                has_tex_mask = has_tex_mask & (alphas > 0.15)
 
             return colors.astype(np.float32), has_tex_mask
         except Exception as e:
@@ -333,44 +427,62 @@ def sample_mesh_with_texture_and_priority(
         for s_mesh, s_idx in split_results:
             final_submeshes.append((s_mesh, s_idx, name))
 
-    # 各メッシュの面積比率計算と最小サンプリング点数の保証 (極小メッシュでも消えないようにする)
-    areas = np.array([max(m[0].area, 1e-9) for m in final_submeshes], dtype=np.float64)
-    weights = areas / np.sum(areas)
+    # 各サブメッシュの「有効テクスチャ比率 (valid_ratio)」を事前推定し、
+    # 透明余白で点数が減ってしまうデカールにも目標点数がフルに行き渡るよう補正する
+    pilot_count = 4000
+    valid_submeshes_info = []
+    for mesh, p_idx, name in final_submeshes:
+        p_pts, p_fidx = trimesh.sample.sample_surface(mesh, pilot_count)
+        _, p_mask = sample_colors_from_submesh(mesh, p_pts, p_fidx)
+        v_ratio = float(np.mean(p_mask)) if len(p_mask) > 0 else 0.0
+        if v_ratio <= 0.0:
+            log(f"     [スキップ] テクスチャが存在しないためガウシアン生成を除外: ノード='{name}'")
+            continue
+        eff_area = max(mesh.area * v_ratio, 1e-9)
+        valid_submeshes_info.append((mesh, p_idx, name, v_ratio, eff_area))
 
-    min_pts_guarantee = min(1000, max(100, num_points // (len(final_submeshes) * 5)))
-    raw_counts = np.round(weights * (num_points - min_pts_guarantee * len(final_submeshes))).astype(int)
+    if len(valid_submeshes_info) == 0:
+        raise ValueError("テクスチャを持つ有効な点群が見つかりませんでした（すべての点にテクスチャが存在しないか透明です）。")
+
+    eff_areas = np.array([info[4] for info in valid_submeshes_info], dtype=np.float64)
+    weights = eff_areas / np.sum(eff_areas)
+
+    # 小さなデカールにも十分な解像度を確保するため最低保証点数を引き上げ
+    min_pts_guarantee = min(10000, max(1000, num_points // (len(valid_submeshes_info) * 3)))
+    raw_counts = np.round(weights * max(0, num_points - min_pts_guarantee * len(valid_submeshes_info))).astype(int)
     sub_counts = np.maximum(raw_counts + min_pts_guarantee, min_pts_guarantee)
 
     diff = num_points - np.sum(sub_counts)
     if diff != 0:
-        sub_counts[np.argmax(areas)] += diff
+        sub_counts[np.argmax(eff_areas)] += diff
 
     all_points = []
     all_colors = []
     all_priorities = []
 
-    log(f"\n  -> 各メッシュへのサンプリング点数割り当て結果 (合計: {num_points:,} 点):")
-    for (mesh, p_idx, name), count in zip(final_submeshes, sub_counts):
-        if count <= 0:
-            log(f"     [スキップ] 点数0: ノード='{name}'")
+    log(f"\n  -> 各メッシュへの有効点数割り当て結果 (有効目標合計: {num_points:,} 点, 均一グリッドサンプリング):")
+    for (mesh, p_idx, name, v_ratio, eff_area), target_valid_count in zip(valid_submeshes_info, sub_counts):
+        if target_valid_count <= 0:
             continue
 
-        log(f"     ・ノード='{name}' (優先度Index: {p_idx}, 表面積: {mesh.area:.5f}): {count:,} 点をサンプリング")
+        # 透明余白 (1 - v_ratio) で除外される分を見越してオーバーサンプリング数を決定
+        raw_grid_count = int(np.ceil(target_valid_count / max(v_ratio, 0.02) * 1.05))
+        raw_grid_count = min(raw_grid_count, target_valid_count * 25)  # 安全上限
 
-        pts, face_indices = trimesh.sample.sample_surface(mesh, count)
+        pts, face_indices = sample_surface_uniform_grid(mesh, raw_grid_count)
         cols, has_tex_mask = sample_colors_from_submesh(mesh, pts, face_indices)
 
-        # テクスチャが存在しない点（テクスチャなしメッシュ、UV未展開面、透過領域など）にはガウシアンを生成しない
         if not np.any(has_tex_mask):
-            log(f"     [スキップ] テクスチャが存在しないためガウシアン生成を除外: ノード='{name}'")
             continue
 
         valid_pts = pts[has_tex_mask]
         valid_cols = cols[has_tex_mask]
         valid_priorities = np.full(len(valid_pts), p_idx, dtype=np.int32)
 
-        if len(valid_pts) < count:
-            log(f"     [テクスチャフィルタ] 非テクスチャ/透明領域 {count - len(valid_pts):,} 点を除外 -> 有効な {len(valid_pts):,} 点のみガウシアン化")
+        log(
+            f"     ・ノード='{name}' (Index: {p_idx}, 有効面積比: {v_ratio*100:.1f}%): "
+            f"グリッド生成 {len(pts):,} 点 -> 透明除外後の有効ガウシアン {len(valid_pts):,} 点 (目標: {target_valid_count:,} 点)"
+        )
 
         all_points.append(valid_pts)
         all_colors.append(valid_cols)
@@ -442,6 +554,21 @@ def convert_mesh_to_gaussian(
     pcd_full = BasicPointCloud(points=points, colors=colors, normals=None)
     full_gaussian = VanillaGaussianModel(sh_degree=3)
     full_gaussian.create_from_pcd(pcd_full, spatial_lr_scale=camera_extent)
+
+    # ★ デカールの直線・角をシャープにするためのスケール引き締め＆エッジ肥大化クリップ
+    # レイヤー（メッシュ）ごとに中央値スケールを算出し、フチで肥大化した外れ値をクリップした上で 0.55 倍に引き締める
+    with torch.no_grad():
+        scales = full_gaussian.get_scaling.detach().clone()  # [N, 3]
+        priorities_t = torch.from_numpy(priorities).to(scales.device)
+        for p_val in torch.unique(priorities_t):
+            p_mask = (priorities_t == p_val)
+            s_sub = scales[p_mask]
+            if s_sub.shape[0] > 0:
+                median_s = torch.quantile(s_sub[:, 0], 0.5)
+                max_allowed = median_s * 1.15
+                scales[p_mask] = torch.clamp(s_sub, max=max_allowed) * 0.55
+        full_gaussian._scaling.data = full_gaussian.scaling_inverse_activation(scales)
+
     full_gaussian._opacity.data = torch.ones_like(full_gaussian._opacity.data) * 4.595  # ~0.99
     full_gaussian.save_ply(output_gs_path)
 
@@ -458,6 +585,13 @@ def convert_mesh_to_gaussian(
         pcd_layer = BasicPointCloud(points=pts_layer, colors=cols_layer, normals=None)
         gs_layer = VanillaGaussianModel(sh_degree=0)
         gs_layer.create_from_pcd(pcd_layer, spatial_lr_scale=camera_extent)
+        with torch.no_grad():
+            s_layer = gs_layer.get_scaling.detach()
+            if s_layer.shape[0] > 0:
+                med_l = torch.quantile(s_layer[:, 0], 0.5)
+                gs_layer._scaling.data = gs_layer.scaling_inverse_activation(
+                    torch.clamp(s_layer, max=med_l * 1.15) * 0.55
+                )
         gs_layer._opacity.data = torch.ones_like(gs_layer._opacity.data) * 4.595
         render_layers_by_idx[idx].append((gs_layer, False))  # is_occluder = False
 
