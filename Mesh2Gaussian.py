@@ -936,6 +936,300 @@ def find_mesh_file_in_dir(dir_path: str) -> Optional[str]:
                 return os.path.join(root, f)
     return None
 
+def test2Dmaskrender(
+    data_dir: str = "Mesh2Gaussian_data",
+    mesh_path: Optional[str] = None,
+    source_path: Optional[str] = None,
+    output_mask_dir: Optional[str] = None,
+    cam_id: int = 0,
+    depth_tolerance: float = 0.005,
+    rotate_x: float = 0.0,
+    rotate_y: float = 0.0,
+    rotate_z: float = 0.0,
+):
+    """
+    【テスト用】ガウシアン化せず「3Dメッシュ（ポリゴン）状態」のまま直接ラスタライズし、
+    除外メッシュによる遮蔽（Zバッファ更新＆マスク領域除外）を行った2Dシルエットマスクを生成する。
+    """
+    print("\n" + "=" * 70)
+    print("[Test] メッシュ直接ラスタライズによる2Dシルエットマスク生成テストを開始...")
+    print("=" * 70)
+
+    # 1. パスの自動解決
+    if mesh_path is None:
+        mesh_path = (
+            find_mesh_file_in_dir(os.path.join(data_dir, "input", "mesh"))
+            or find_mesh_file_in_dir(os.path.join(data_dir, "input"))
+        )
+    if source_path is None:
+        source_path = os.path.join(data_dir, "input", "colmap")
+    if output_mask_dir is None:
+        output_mask_dir = os.path.join(data_dir, "output", "masks_mesh_test")
+    os.makedirs(output_mask_dir, exist_ok=True)
+
+    # 2. GLBメッシュの読み込みとレイヤー分類 (is_occluder の判定)
+    loaded = trimesh.load(mesh_path, process=False)
+    raw_meshes = []  # List of (trimesh.Trimesh, mesh_idx, node_name, is_excluded_last)
+    if isinstance(loaded, trimesh.Scene):
+        parents_map = getattr(loaded.graph.transforms, "parents", {})
+        base_frame = loaded.graph.base_frame
+        nodes_with_mesh = []
+        for default_idx, node_name in enumerate(loaded.graph.nodes):
+            geom_name = loaded.graph.transforms.node_data.get(node_name, {}).get("geometry", None)
+            if geom_name is None and node_name in loaded.geometry:
+                geom_name = node_name
+            if geom_name is not None and geom_name in loaded.geometry:
+                nodes_with_mesh.append((default_idx, node_name, geom_name))
+        if len(nodes_with_mesh) == 0:
+            for default_idx, (name, _) in enumerate(loaded.geometry.items()):
+                nodes_with_mesh.append((default_idx, name, name))
+        valid_mesh_nodes = []
+        for default_idx, node_name, geom_name in nodes_with_mesh:
+            geom = loaded.geometry[geom_name]
+            if isinstance(geom, trimesh.Trimesh) and len(geom.vertices) > 0 and len(geom.faces) > 0:
+                valid_mesh_nodes.append((default_idx, node_name, geom_name))
+        total_valid = len(valid_mesh_nodes)
+        for mesh_count, (default_idx, node_name, geom_name) in enumerate(valid_mesh_nodes):
+            geom = loaded.geometry[geom_name]
+            mesh_idx = extract_mesh_index(node_name, default_idx)
+            # 安全なワールド変換行列の取得 ('GLTF' 等の独立ノードでもエラーにならないよう保護)
+            try:
+                if node_name in parents_map:
+                    parent_node = parents_map[node_name]
+                    T_parent_world = (
+                        np.eye(4)
+                        if parent_node == base_frame
+                        else loaded.graph.get(frame_to=parent_node, frame_from=base_frame)[0]
+                    )
+                    T_child_local, _ = loaded.graph.get(frame_to=node_name, frame_from=parent_node)
+                    transform = T_parent_world @ T_child_local
+                else:
+                    transform, _ = loaded.graph.get(frame_to=node_name, frame_from=base_frame)
+            except Exception:
+                transform = np.eye(4)
+                edge_data = getattr(loaded.graph.transforms, "edge_data", {})
+                curr = node_name
+                visited = set()
+                while curr in parents_map and curr not in visited:
+                    visited.add(curr)
+                    p = parents_map[curr]
+                    mat = edge_data.get((p, curr), {}).get("matrix", np.eye(4))
+                    transform = mat @ transform
+                    curr = p
+            geom_transformed = geom.copy()
+            geom_transformed.apply_transform(transform)
+            if rotate_x != 0.0 or rotate_y != 0.0 or rotate_z != 0.0:
+                geom_transformed.vertices = apply_euler_rotation(
+                    geom_transformed.vertices.astype(np.float32), rotate_x, rotate_y, rotate_z
+                )
+            is_last_excluded = (total_valid > 1 and mesh_count == total_valid - 1)
+            raw_meshes.append((geom_transformed, mesh_idx, node_name, is_last_excluded))
+    elif isinstance(loaded, trimesh.Trimesh):
+        geom_transformed = loaded.copy()
+        if rotate_x != 0.0 or rotate_y != 0.0 or rotate_z != 0.0:
+            geom_transformed.vertices = apply_euler_rotation(
+                geom_transformed.vertices.astype(np.float32), rotate_x, rotate_y, rotate_z
+            )
+        raw_meshes.append((geom_transformed, 0, "root", False))
+
+    # サブメッシュ分割 ＆ テクスチャ情報の抽出
+    # mesh_layers_by_idx[idx] = List of dict(verts, faces, uvs, tex_alpha, is_occluder, name)
+    mesh_layers_by_idx: Dict[int, List[ dict ]] = {}
+    for m, m_idx, name, is_last_excluded in raw_meshes:
+        sub_list = [(m, m_idx)] if is_last_excluded else split_submeshes_by_material(m, m_idx)
+        for s_mesh, s_idx in sub_list:
+            tex_img = None
+            mat = getattr(s_mesh.visual, "material", None)
+            if mat is not None:
+                if hasattr(mat, "baseColorTexture") and mat.baseColorTexture is not None:
+                    tex_img = mat.baseColorTexture.convert("RGBA")
+                elif hasattr(mat, "image") and mat.image is not None:
+                    tex_img = mat.image.convert("RGBA")
+            has_uv = (
+                tex_img is not None
+                and hasattr(s_mesh.visual, "uv")
+                and s_mesh.visual.uv is not None
+                and len(s_mesh.visual.uv) > 0
+            )
+            # 末尾除外メッシュ または テクスチャを持たないメッシュは「遮蔽用オクルーダー(is_occluder=True)」
+            is_occluder = is_last_excluded or (not has_uv)
+            tex_alpha_t = None
+            uvs_t = None
+            if not is_occluder:
+                tex_np = np.asarray(tex_img, dtype=np.float32) / 255.0
+                alpha_np = tex_np[:, :, 3] if tex_np.shape[2] >= 4 else np.ones(tex_np.shape[:2], dtype=np.float32)
+                tex_alpha_t = torch.from_numpy(alpha_np).float().cuda()
+                uvs_t = torch.from_numpy(np.asarray(s_mesh.visual.uv, dtype=np.float32)).float().cuda()
+            layer_info = {
+                "verts": torch.from_numpy(np.asarray(s_mesh.vertices, dtype=np.float32)).float().cuda(),
+                "faces": torch.from_numpy(np.asarray(s_mesh.faces, dtype=np.int64)).long().cuda(),
+                "uvs": uvs_t,
+                "tex_alpha": tex_alpha_t,
+                "is_occluder": is_occluder,
+                "name": name,
+            }
+            mesh_layers_by_idx.setdefault(int(s_idx), []).append(layer_info)
+            role_str = "遮蔽用オクルーダー(マスク外)" if is_occluder else "マスク対象(テクスチャ有)"
+            print(f"  ・レイヤー登録: ノード='{name}' (Index: {s_idx}, 面数: {len(s_mesh.faces):,}) -> [{role_str}]")
+    
+    # 3. 1カメラ分のメッシュ直接ラスタライズ関数 (内部Zバッファ合成)
+    def rasterize_mesh_mask_for_camera(cam) -> Tuple[torch.Tensor, Image.Image]:
+        H, W = cam.image_height, cam.image_width
+        z_buffer = torch.full((H, W), float("inf"), dtype=torch.float32, device="cuda")
+        mask_buffer = torch.zeros((H, W), dtype=torch.bool, device="cuda")
+        R = torch.from_numpy(cam.R).float().cuda()
+        T = torch.from_numpy(cam.T).float().cuda()
+        fx = float(W) / (2.0 * float(np.tan(cam.FoVx / 2.0)))
+        fy = float(H) / (2.0 * float(np.tan(cam.FoVy / 2.0)))
+        cx = float(W) / 2.0
+        cy = float(H) / 2.0
+        for idx in sorted(mesh_layers_by_idx.keys()):
+            for layer in mesh_layers_by_idx[idx]:
+                verts = layer["verts"]
+                faces = layer["faces"]
+                is_occluder = layer["is_occluder"]
+                uvs = layer["uvs"]
+                tex_alpha = layer["tex_alpha"]
+                # World -> Camera 座標変換
+                verts_cam = torch.matmul(verts, R) + T  # [V, 3]
+                z_v = verts_cam[:, 2]
+                u_v = verts_cam[:, 0] * fx / z_v.clamp(min=1e-5) + cx
+                v_v = verts_cam[:, 1] * fy / z_v.clamp(min=1e-5) + cy
+                # 各三角形の3頂点座標を取得 [F, 3]
+                f0, f1, f2 = faces[:, 0], faces[:, 1], faces[:, 2]
+                z0, z1, z2 = z_v[f0], z_v[f1], z_v[f2]
+                u0, u1, u2 = u_v[f0], u_v[f1], u_v[f2]
+                v0, v1, v2 = v_v[f0], v_v[f1], v_v[f2]
+                # カメラ前方かつ画面内に入る三角形のみ抽出
+                valid_f = (z0 > 0.01) & (z1 > 0.01) & (z2 > 0.01)
+                umin = torch.clamp(torch.floor(torch.minimum(torch.minimum(u0, u1), u2)).long(), 0, W - 1)
+                umax = torch.clamp(torch.ceil(torch.maximum(torch.maximum(u0, u1), u2)).long(), 0, W - 1)
+                vmin = torch.clamp(torch.floor(torch.minimum(torch.minimum(v0, v1), v2)).long(), 0, H - 1)
+                vmax = torch.clamp(torch.ceil(torch.maximum(torch.maximum(v0, v1), v2)).long(), 0, H - 1)
+                in_view = (
+                    valid_f
+                    & (torch.maximum(torch.maximum(u0, u1), u2) >= 0)
+                    & (torch.minimum(torch.minimum(u0, u1), u2) < W)
+                    & (torch.maximum(torch.maximum(v0, v1), v2) >= 0)
+                    & (torch.minimum(torch.minimum(v0, v1), v2) < H)
+                )
+                # 縮退していない三角形のみ
+                denom = (v1 - v2) * (u0 - u2) + (u2 - u1) * (v0 - v2)
+                in_view = in_view & (torch.abs(denom) > 1e-6)
+                active_faces = torch.where(in_view)[0]
+                if active_faces.numel() == 0:
+                    continue
+                # このレイヤーのピクセル単位の最小深度バッファ
+                layer_depth = torch.full((H * W,), float("inf"), dtype=torch.float32, device="cuda")
+                # 각三角形のBBoxピクセル数を見積もり、GPUメモリに収まるチャンク単位で並列ラスタライズ
+                du = (umax[active_faces] - umin[active_faces] + 1)
+                dv = (vmax[active_faces] - vmin[active_faces] + 1)
+                box_areas = du * dv
+                # 1チャンクあたり最大約200万候補ピクセルずつ処理
+                cum_areas = torch.cumsum(box_areas, dim=0)
+                chunk_size_limit = 2_000_000
+                num_chunks = int((cum_areas[-1].item() // chunk_size_limit) + 1)
+                for c_i in range(num_chunks):
+                    mask_c = (cum_areas > c_i * chunk_size_limit) & (cum_areas <= (c_i + 1) * chunk_size_limit)
+                    if c_i == 0:
+                        mask_c = cum_areas <= chunk_size_limit
+                    f_chunk = active_faces[mask_c]
+                    if f_chunk.numel() == 0:
+                        continue
+                    c_du = du[mask_c]
+                    c_dv = dv[mask_c]
+                    c_areas = box_areas[mask_c]
+                    # 各三角形のBBox内ピクセル座標 (px, py) を一括展開
+                    face_rep = torch.repeat_interleave(torch.arange(f_chunk.numel(), device="cuda"), c_areas)
+                    offsets = torch.arange(c_areas.sum(), device="cuda") - torch.repeat_interleave(
+                        torch.cumsum(c_areas, dim=0) - c_areas, c_areas
+                    )
+                    w_box = c_du[face_rep]
+                    px = umin[f_chunk[face_rep]] + (offsets % w_box)
+                    py = vmin[f_chunk[face_rep]] + (offsets // w_box)
+                    px_f = px.float()
+                    py_f = py.float()
+                    gf = f_chunk[face_rep]
+                    # 重心座標 (w0, w1, w2) の計算
+                    d_f = denom[gf]
+                    w0 = ((v1[gf] - v2[gf]) * (px_f - u2[gf]) + (u2[gf] - u1[gf]) * (py_f - v2[gf])) / d_f
+                    w1 = ((v2[gf] - v0[gf]) * (px_f - u2[gf]) + (u0[gf] - u2[gf]) * (py_f - v2[gf])) / d_f
+                    w2 = 1.0 - w0 - w1
+                    inside = (w0 >= -1e-4) & (w1 >= -1e-4) & (w2 >= -1e-4)
+                    if not torch.any(inside):
+                        continue
+                    px = px[inside]
+                    py = py[inside]
+                    gf = gf[inside]
+                    w0, w1, w2 = w0[inside], w1[inside], w2[inside]
+                    # 透視補正 (Perspective-correct) 深度の補間
+                    inv_z0 = 1.0 / z0[gf]
+                    inv_z1 = 1.0 / z1[gf]
+                    inv_z2 = 1.0 / z2[gf]
+                    z_pix = 1.0 / (w0 * inv_z0 + w1 * inv_z1 + w2 * inv_z2)
+                    # マスク対象メッシュの場合はUVテクスチャのアルファ値を確認（透明領域はスルー）
+                    if not is_occluder and uvs is not None and tex_alpha is not None:
+                        f0_g, f1_g, f2_g = faces[gf, 0], faces[gf, 1], faces[gf, 2]
+                        uv0, uv1, uv2 = uvs[f0_g], uvs[f1_g], uvs[f2_g]
+                        # UV全頂点が0の未展開面は除外
+                        not_zero_uv = ~(
+                            (torch.abs(uv0).sum(dim=-1) < 1e-5)
+                            & (torch.abs(uv1).sum(dim=-1) < 1e-5)
+                            & (torch.abs(uv2).sum(dim=-1) < 1e-5)
+                        )
+                        uv_pix = z_pix[:, None] * (
+                            w0[:, None] * (uv0 * inv_z0[:, None])
+                            + w1[:, None] * (uv1 * inv_z1[:, None])
+                            + w2[:, None] * (uv2 * inv_z2[:, None])
+                        )
+                        tex_h, tex_w = tex_alpha.shape
+                        u_tex = torch.clamp(torch.round((uv_pix[:, 0] % 1.0) * (tex_w - 1)).long(), 0, tex_w - 1)
+                        v_tex = torch.clamp(torch.round((1.0 - (uv_pix[:, 1] % 1.0)) * (tex_h - 1)).long(), 0, tex_h - 1)
+                        alpha_val = tex_alpha[v_tex, u_tex]
+                        valid_tex = not_zero_uv & (alpha_val > 0.05)
+                        if not torch.any(valid_tex):
+                            continue
+                        px = px[valid_tex]
+                        py = py[valid_tex]
+                        z_pix = z_pix[valid_tex]
+                    flat_idx = py * W + px
+                    layer_depth.scatter_reduce_(0, flat_idx, z_pix, reduce="amin", include_self=True)
+                rendered_depth = layer_depth.view(H, W)
+                valid_pixel = torch.isfinite(rendered_depth)
+                if is_occluder:
+                    # 除外メッシュ（オクルーダー）:
+                    # Zバッファは更新して裏側を隠すが、マスク領域からは外す (False)
+                    # 同一平面(depth_tolerance以内)のデカールは消さないよう、明確に手前の場合のみ上書き
+                    is_strictly_closer = rendered_depth < (z_buffer - depth_tolerance)
+                    is_closer_unmasked = (~mask_buffer) & (rendered_depth < z_buffer)
+                    update_pixels = valid_pixel & (is_strictly_closer | is_closer_unmasked)
+                    z_buffer[update_pixels] = rendered_depth[update_pixels]
+                    mask_buffer[update_pixels] = False
+                else:
+                    # マスク対象メッシュ:
+                    is_closer = rendered_depth < (z_buffer - depth_tolerance)
+                    is_coplanar_higher = torch.abs(rendered_depth - z_buffer) <= depth_tolerance
+                    update_pixels = valid_pixel & (is_closer | is_coplanar_higher)
+                    z_buffer[update_pixels] = rendered_depth[update_pixels]
+                    mask_buffer[update_pixels] = True
+        mask_np = (mask_buffer.cpu().numpy() * 255).astype(np.uint8)
+        return mask_buffer, Image.fromarray(mask_np, mode="L")
+    # 4. Colmapカメラを読み込んでマスクを一括出力
+    _, scene = load_base_scene(source_path=source_path, model_path=None, iteration=-1)
+    train_cams = scene.getTrainCameras()
+    # 基準カメラ (cam_id) のマスク保存
+    target_cam = train_cams[min(cam_id, len(train_cams) - 1)]
+    _, single_mask_img = rasterize_mesh_mask_for_camera(target_cam)
+    single_out_path = os.path.join(output_mask_dir, f"mask_cam{cam_id}.png")
+    single_mask_img.save(single_out_path)
+    print(f"  -> 基準カメラ({cam_id})のメッシュ直接マスクを保存: {single_out_path}")
+    # 全カメラ視点のマスク保存
+    multiview_dir = os.path.join(output_mask_dir, "multiview")
+    os.makedirs(multiview_dir, exist_ok=True)
+    for idx, cam in enumerate(train_cams):
+        _, m_img = rasterize_mesh_mask_for_camera(cam)
+        m_img.save(os.path.join(multiview_dir, f"mask_cam_{idx:04d}.png"))
+    print(f"[Success] 全 {len(train_cams)} 視点のメッシュ直接2Dマスクを保存しました: {multiview_dir}\n")
 
 def main():
     parser = argparse.ArgumentParser(
@@ -1176,6 +1470,6 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    test2Dmaskrender()
 
 
