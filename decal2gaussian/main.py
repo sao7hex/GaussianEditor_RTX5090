@@ -100,7 +100,7 @@ def main():
             )
             print(f"train.py による 3DGS 生成完了: {saved_ply}")
         else:
-            output_ply = project_dir / "output" / "point_cloud.ply"
+            output_ply = project_dir / "output" / "finetuned_model" / "point_cloud.ply"
             saved_ply = train_3dgs_from_merged_images(
                 gaussian=gaussian,
                 scene=scene,
