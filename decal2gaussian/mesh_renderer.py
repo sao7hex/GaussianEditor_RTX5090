@@ -60,7 +60,6 @@ def _prepare_trimesh_for_pyrender(
     if mat is None:
         return geom, False
 
-    # SimpleMaterial 等の場合は PBRMaterial に変換
     if not isinstance(mat, trimesh.visual.material.PBRMaterial):
         to_pbr = getattr(mat, "to_pbr", None)
         if callable(to_pbr):
@@ -84,7 +83,6 @@ def _prepare_trimesh_for_pyrender(
     if tex is not None:
         if not isinstance(tex, Image.Image):
             tex = Image.fromarray(np.asarray(tex))
-        # パレット(P)やグレースケール+アルファ(LA)も含めて確実に RGBA 化
         if tex.mode != "RGBA":
             tex = tex.convert("RGBA")
         tex_arr = np.asarray(tex)
@@ -103,6 +101,39 @@ def _prepare_trimesh_for_pyrender(
     return geom, has_alpha
 
 
+def _create_pyrender_scene(flat: bool) -> "pyrender.Scene":
+    import pyrender
+
+    scene = pyrender.Scene(
+        bg_color=[0.0, 0.0, 0.0, 0.0],
+        ambient_light=[1.0, 1.0, 1.0],
+    )
+    if not flat:
+        light = pyrender.DirectionalLight(color=[1.0, 1.0, 1.0], intensity=3.0)
+        scene.add(light, pose=np.eye(4))
+    return scene
+
+
+def _build_pyrender_mesh(
+    geom: trimesh.Trimesh,
+    has_alpha: bool,
+    alpha_mode: str,
+    alpha_cutoff: float,
+):
+    import pyrender
+
+    pr_mesh = pyrender.Mesh.from_trimesh(geom, smooth=False)
+    for prim in pr_mesh.primitives:
+        if prim.material is not None and has_alpha:
+            prim.material.alphaMode = alpha_mode
+            if alpha_mode == "MASK":
+                prim.material.alphaCutoff = float(alpha_cutoff)
+            tex = getattr(prim.material, "baseColorTexture", None)
+            if tex is not None:
+                tex.source_channels = "RGBA"
+    return pr_mesh
+
+
 def render_glb_from_cameras(
     meshes: List[Tuple[str, trimesh.Trimesh]],
     cameras: List,
@@ -111,21 +142,22 @@ def render_glb_from_cameras(
     flat: bool = True,
     alpha_mode: str = "BLEND",
     alpha_cutoff: float = 0.05,
+    depth_tolerance: float = 0.01,
 ) -> List[Path]:
     """
     読み込んだ GLB メッシュ群を COLMAP カメラ視点からオフスクリーンレンダリングし、RGBA PNG として保存する。
+    透明ありメッシュは個別に描画して深度バッファ合成することで、透明領域が奥のメッシュを消す問題や
+    同一平面上の Z-fighting を防ぐ。
     """
     import pyrender
 
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    pr_scene = pyrender.Scene(
-        bg_color=[0.0, 0.0, 0.0, 0.0],
-        ambient_light=[1.0, 1.0, 1.0],
-    )
+    opaque_scene = _create_pyrender_scene(flat=flat)
+    has_opaque = False
+    transparent_scenes: List[Tuple[str, "pyrender.Scene"]] = []
 
-    added_count = 0
     for node_name, geom in meshes:
         if len(geom.vertices) == 0 or len(geom.faces) == 0:
             continue
@@ -136,27 +168,20 @@ def render_glb_from_cameras(
                     alpha_mode=alpha_mode,
                     alpha_cutoff=alpha_cutoff,
                 )
-                pr_mesh = pyrender.Mesh.from_trimesh(norm_geom, smooth=False)
-                for prim in pr_mesh.primitives:
-                    if prim.material is not None and has_alpha:
-                        prim.material.alphaMode = alpha_mode
-                        if alpha_mode == "MASK":
-                            prim.material.alphaCutoff = float(alpha_cutoff)
-                        tex = getattr(prim.material, "baseColorTexture", None)
-                        if tex is not None:
-                            tex.source_channels = "RGBA"
-                pr_scene.add(pr_mesh, name=sub_name)
-                added_count += 1
-                print(f"  [Mesh] '{sub_name}': faces={len(norm_geom.faces):,}, transparent={has_alpha}, alphaMode={alpha_mode if has_alpha else 'OPAQUE'}")
+                pr_mesh = _build_pyrender_mesh(norm_geom, has_alpha, alpha_mode, alpha_cutoff)
+                if has_alpha:
+                    t_scene = _create_pyrender_scene(flat=flat)
+                    t_scene.add(pr_mesh, name=sub_name)
+                    transparent_scenes.append((sub_name, t_scene))
+                else:
+                    opaque_scene.add(pr_mesh, name=sub_name)
+                    has_opaque = True
+                print(f"  [Mesh] '{sub_name}': faces={len(norm_geom.faces):,}, transparent={has_alpha}")
             except Exception as e:
                 print(f"  [Warning] メッシュ '{sub_name}' の pyrender 変換をスキップしました: {e}")
 
-    if added_count == 0:
+    if not has_opaque and not transparent_scenes:
         raise RuntimeError("レンダリング可能な有効メッシュがありません。")
-
-    if not flat:
-        light = pyrender.DirectionalLight(color=[1.0, 1.0, 1.0], intensity=3.0)
-        pr_scene.add(light, pose=np.eye(4))
 
     target_indices = cam_indices if cam_indices is not None else list(range(len(cameras)))
     flags = pyrender.RenderFlags.RGBA
@@ -166,6 +191,7 @@ def render_glb_from_cameras(
     renderer = None
     current_size = None
     saved_paths: List[Path] = []
+    alpha_thresh_u8 = max(1, int(round(alpha_cutoff * 255)))
 
     try:
         for i, idx in enumerate(target_indices):
@@ -189,18 +215,48 @@ def render_glb_from_cameras(
                 zfar=float(cam.zfar),
             )
             cam_pose = colmap_cam_to_opengl_pose(cam)
-            cam_node = pr_scene.add(pr_cam, pose=cam_pose)
 
-            color_rgba, _ = renderer.render(pr_scene, flags=flags)
-            pr_scene.remove_node(cam_node)
+            # 1. 不透明メッシュをベースとして描画
+            if has_opaque:
+                cam_node = opaque_scene.add(pr_cam, pose=cam_pose)
+                comp_rgba, comp_depth = renderer.render(opaque_scene, flags=flags)
+                opaque_scene.remove_node(cam_node)
+                comp_rgba = comp_rgba.astype(np.float32)
+                z_buffer = np.where(comp_depth > 0.0, comp_depth, np.inf).astype(np.float32)
+            else:
+                comp_rgba = np.zeros((H, W, 4), dtype=np.float32)
+                z_buffer = np.full((H, W), np.inf, dtype=np.float32)
 
+            # 2. 透明ありメッシュ (デカール等) を1つずつ描画し、有効アルファ部分のみ Z テストして合成
+            for _, t_scene in transparent_scenes:
+                cam_node = t_scene.add(pr_cam, pose=cam_pose)
+                layer_rgba, layer_depth = renderer.render(t_scene, flags=flags)
+                t_scene.remove_node(cam_node)
+
+                valid_pixel = (layer_rgba[:, :, 3] >= alpha_thresh_u8) & (layer_depth > 0.0)
+                is_closer = layer_depth < (z_buffer - depth_tolerance)
+                is_coplanar = np.abs(layer_depth - z_buffer) <= depth_tolerance
+                update_mask = valid_pixel & (is_closer | is_coplanar)
+
+                if np.any(update_mask):
+                    src_rgb = layer_rgba[update_mask, :3].astype(np.float32)
+                    src_a = layer_rgba[update_mask, 3:4].astype(np.float32) / 255.0
+                    dst_rgb = comp_rgba[update_mask, :3]
+                    dst_a = comp_rgba[update_mask, 3:4] / 255.0
+
+                    out_a = src_a + dst_a * (1.0 - src_a)
+                    comp_rgba[update_mask, :3] = src_rgb * src_a + dst_rgb * (1.0 - src_a)
+                    comp_rgba[update_mask, 3:4] = np.clip(out_a * 255.0, 0.0, 255.0)
+                    z_buffer[update_mask] = layer_depth[update_mask]
+
+            out_u8 = np.clip(comp_rgba, 0.0, 255.0).astype(np.uint8)
             if i == 0:
-                a_min, a_max = int(color_rgba[:, :, 3].min()), int(color_rgba[:, :, 3].max())
-                print(f"  [Render Check] cam={idx}, output shape={color_rgba.shape}, alpha range=[{a_min}, {a_max}]")
+                a_min, a_max = int(out_u8[:, :, 3].min()), int(out_u8[:, :, 3].max())
+                print(f"  [Render Check] cam={idx}, output shape={out_u8.shape}, alpha range=[{a_min}, {a_max}]")
 
             stem = Path(cam.image_name).stem if getattr(cam, "image_name", None) else f"cam_{idx:04d}"
             save_path = out_dir / f"{idx:04d}_{stem}.png"
-            Image.fromarray(color_rgba, mode="RGBA").save(save_path)
+            Image.fromarray(out_u8, mode="RGBA").save(save_path)
             saved_paths.append(save_path)
     finally:
         if renderer is not None:
