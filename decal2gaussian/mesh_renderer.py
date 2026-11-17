@@ -142,7 +142,7 @@ def render_glb_from_cameras(
     flat: bool = True,
     alpha_mode: str = "BLEND",
     alpha_cutoff: float = 0.05,
-    depth_tolerance: float = 0.01,
+    depth_tolerance: float = 0.0005,
 ) -> List[Path]:
     """
     読み込んだ GLB メッシュ群を COLMAP カメラ視点からオフスクリーンレンダリングし、RGBA PNG として保存する。

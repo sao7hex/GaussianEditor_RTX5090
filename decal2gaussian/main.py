@@ -25,6 +25,7 @@ def main():
     parser.add_argument("--shaded", action="store_true", help="ライティングあり (非フラット) でレンダリングする")
     parser.add_argument("--alpha_mode", type=str, default="BLEND", choices=["MASK", "BLEND", "OPAQUE"], help="透明領域の描画モード (デフォルト: BLEND)")
     parser.add_argument("--alpha_cutoff", type=float, default=0.05, help="MASKモード時の透明判定しきい値 (デフォルト: 0.05)")
+    parser.add_argument("--depth_tolerance", type=float, default=0.0005, help="同一平面判定の深度許容誤差 (デフォルト: 0.0005)")
     args = parser.parse_args()
 
     # 1. 入力パスの解決
@@ -55,6 +56,7 @@ def main():
         flat=not args.shaded,
         alpha_mode=args.alpha_mode,
         alpha_cutoff=args.alpha_cutoff,
+        depth_tolerance=args.depth_tolerance,
     )
     print(f"レンダリング完了: {len(saved_paths)} 枚を保存しました -> {render_dir}")
 
