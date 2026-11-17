@@ -138,30 +138,47 @@ def render_glb_from_cameras(
     meshes: List[Tuple[str, trimesh.Trimesh]],
     cameras: List,
     output_dir: str,
+    full_output_dir: Optional[str] = None,
     cam_indices: Optional[List[int]] = None,
     flat: bool = True,
     alpha_mode: str = "MASK",
     alpha_cutoff: float = 0.05,
     depth_tolerance: float = 0.0005,
     double_sided: bool = False,
+    occlude_last_mesh: bool = True,
 ) -> List[Path]:
     """
     読み込んだ GLB メッシュ群を COLMAP カメラ視点からオフスクリーンレンダリングし、RGBA PNG として保存する。
-    透明ありメッシュは個別に描画して深度バッファ合成することで、透明領域が奥のメッシュを消す問題や
-    同一平面上の Z-fighting を防ぐ。
+    occlude_last_mesh=True の場合、最後のメッシュを遮蔽専用 (オクルーダー) として扱い、
+    深度遮蔽には使うが出力画像上では透過 (alpha=0) にする。
+    full_output_dir が指定された場合は、オクルーダー化していない (全メッシュ描画) 画像も同時に保存する。
     """
     import pyrender
 
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    full_dir = Path(full_output_dir) if full_output_dir is not None else None
+    if full_dir is not None:
+        full_dir.mkdir(parents=True, exist_ok=True)
 
+    valid_meshes = [
+        (node_name, geom)
+        for node_name, geom in meshes
+        if len(geom.vertices) > 0 and len(geom.faces) > 0
+    ]
+    if not valid_meshes:
+        raise RuntimeError("レンダリング可能な有効メッシュがありません。")
+
+    occluder_scene = _create_pyrender_scene(flat=flat)
+    has_occluder = False
     opaque_scene = _create_pyrender_scene(flat=flat)
     has_opaque = False
     transparent_scenes: List[Tuple[str, "pyrender.Scene"]] = []
 
-    for node_name, geom in meshes:
-        if len(geom.vertices) == 0 or len(geom.faces) == 0:
-            continue
+    last_mesh_idx = len(valid_meshes) - 1 if (occlude_last_mesh and len(valid_meshes) > 1) else -1
+
+    for mesh_idx, (node_name, geom) in enumerate(valid_meshes):
+        is_occluder = (mesh_idx == last_mesh_idx)
         for sub_name, sub_geom in _split_submeshes_by_material(geom, node_name):
             try:
                 norm_geom, has_alpha = _prepare_trimesh_for_pyrender(
@@ -170,18 +187,23 @@ def render_glb_from_cameras(
                     alpha_cutoff=alpha_cutoff,
                 )
                 pr_mesh = _build_pyrender_mesh(norm_geom, has_alpha, alpha_mode, alpha_cutoff)
-                if has_alpha:
+                if is_occluder:
+                    occluder_scene.add(pr_mesh, name=sub_name)
+                    has_occluder = True
+                    print(f"  [Mesh] '{sub_name}': faces={len(norm_geom.faces):,}, role=OCCLUDER (透過対象)")
+                elif has_alpha:
                     t_scene = _create_pyrender_scene(flat=flat)
                     t_scene.add(pr_mesh, name=sub_name)
                     transparent_scenes.append((sub_name, t_scene))
+                    print(f"  [Mesh] '{sub_name}': faces={len(norm_geom.faces):,}, transparent=True, alphaMode={alpha_mode}")
                 else:
                     opaque_scene.add(pr_mesh, name=sub_name)
                     has_opaque = True
-                print(f"  [Mesh] '{sub_name}': faces={len(norm_geom.faces):,}, transparent={has_alpha}, alphaMode={alpha_mode if has_alpha else 'OPAQUE'}")
+                    print(f"  [Mesh] '{sub_name}': faces={len(norm_geom.faces):,}, transparent=False, alphaMode=OPAQUE")
             except Exception as e:
                 print(f"  [Warning] メッシュ '{sub_name}' の pyrender 変換をスキップしました: {e}")
 
-    if not has_opaque and not transparent_scenes:
+    if not has_occluder and not has_opaque and not transparent_scenes:
         raise RuntimeError("レンダリング可能な有効メッシュがありません。")
 
     target_indices = cam_indices if cam_indices is not None else list(range(len(cameras)))
@@ -219,18 +241,37 @@ def render_glb_from_cameras(
             )
             cam_pose = colmap_cam_to_opengl_pose(cam)
 
-            # 1. 不透明メッシュをベースとして描画
+            comp_rgba = np.zeros((H, W, 4), dtype=np.float32)
+            comp_full = np.zeros((H, W, 4), dtype=np.float32) if full_dir is not None else None
+            z_buffer = np.full((H, W), np.inf, dtype=np.float32)
+
+            # 1. 最後のメッシュ (オクルーダー) は深度のみ z_buffer に記録し、色は comp_rgba には描画しない (透過)
+            if has_occluder:
+                cam_node = occluder_scene.add(pr_cam, pose=cam_pose)
+                occ_rgba, occ_depth = renderer.render(occluder_scene, flags=flags)
+                occluder_scene.remove_node(cam_node)
+                z_buffer = np.where(occ_depth > 0.0, occ_depth, np.inf).astype(np.float32)
+                if comp_full is not None:
+                    comp_full = occ_rgba.astype(np.float32)
+
+            # 2. その他の不透明メッシュを描画 (オクルーダーより手前または同一平面の領域のみ)
             if has_opaque:
                 cam_node = opaque_scene.add(pr_cam, pose=cam_pose)
-                comp_rgba, comp_depth = renderer.render(opaque_scene, flags=flags)
+                op_rgba, op_depth = renderer.render(opaque_scene, flags=flags)
                 opaque_scene.remove_node(cam_node)
-                comp_rgba = comp_rgba.astype(np.float32)
-                z_buffer = np.where(comp_depth > 0.0, comp_depth, np.inf).astype(np.float32)
-            else:
-                comp_rgba = np.zeros((H, W, 4), dtype=np.float32)
-                z_buffer = np.full((H, W), np.inf, dtype=np.float32)
 
-            # 2. 透明ありメッシュ (デカール等) を1つずつ描画し、有効アルファ部分のみ Z テストして合成
+                valid_op = op_depth > 0.0
+                is_closer = op_depth < (z_buffer - depth_tolerance)
+                is_coplanar = np.abs(op_depth - z_buffer) <= depth_tolerance
+                update_op = valid_op & (is_closer | is_coplanar)
+                if np.any(update_op):
+                    op_f32 = op_rgba[update_op].astype(np.float32)
+                    comp_rgba[update_op] = op_f32
+                    if comp_full is not None:
+                        comp_full[update_op] = op_f32
+                    z_buffer[update_op] = op_depth[update_op]
+
+            # 3. 透明ありメッシュ (デカール等) を1つずつ描画し、有効アルファ部分のみ Z テストして合成
             for _, t_scene in transparent_scenes:
                 cam_node = t_scene.add(pr_cam, pose=cam_pose)
                 layer_rgba, layer_depth = renderer.render(t_scene, flags=flags)
@@ -244,12 +285,20 @@ def render_glb_from_cameras(
                 if np.any(update_mask):
                     src_rgb = layer_rgba[update_mask, :3].astype(np.float32)
                     src_a = layer_rgba[update_mask, 3:4].astype(np.float32) / 255.0
+
                     dst_rgb = comp_rgba[update_mask, :3]
                     dst_a = comp_rgba[update_mask, 3:4] / 255.0
-
                     out_a = src_a + dst_a * (1.0 - src_a)
                     comp_rgba[update_mask, :3] = src_rgb * src_a + dst_rgb * (1.0 - src_a)
                     comp_rgba[update_mask, 3:4] = np.clip(out_a * 255.0, 0.0, 255.0)
+
+                    if comp_full is not None:
+                        full_dst_rgb = comp_full[update_mask, :3]
+                        full_dst_a = comp_full[update_mask, 3:4] / 255.0
+                        full_out_a = src_a + full_dst_a * (1.0 - src_a)
+                        comp_full[update_mask, :3] = src_rgb * src_a + full_dst_rgb * (1.0 - src_a)
+                        comp_full[update_mask, 3:4] = np.clip(full_out_a * 255.0, 0.0, 255.0)
+
                     z_buffer[update_mask] = layer_depth[update_mask]
 
             out_u8 = np.clip(comp_rgba, 0.0, 255.0).astype(np.uint8)
@@ -261,6 +310,10 @@ def render_glb_from_cameras(
             save_path = out_dir / f"{idx:04d}_{stem}.png"
             Image.fromarray(out_u8, mode="RGBA").save(save_path)
             saved_paths.append(save_path)
+
+            if comp_full is not None and full_dir is not None:
+                full_u8 = np.clip(comp_full, 0.0, 255.0).astype(np.uint8)
+                Image.fromarray(full_u8, mode="RGBA").save(full_dir / f"{idx:04d}_{stem}.png")
     finally:
         if renderer is not None:
             renderer.delete()

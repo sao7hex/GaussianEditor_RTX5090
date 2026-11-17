@@ -26,6 +26,8 @@ def main():
     parser.add_argument("--alpha_mode", type=str, default="MASK", choices=["MASK", "BLEND", "OPAQUE"], help="透明領域の描画モード (デフォルト: MASK)")
     parser.add_argument("--alpha_cutoff", type=float, default=0.05, help="MASKモード時の透明判定しきい値 (デフォルト: 0.05)")
     parser.add_argument("--depth_tolerance", type=float, default=0.0005, help="同一平面判定の深度許容誤差 (デフォルト: 0.0005)")
+    parser.add_argument("--double_sided", action="store_true", help="背面カリングを無効化し、法線が裏向きのポリゴンも両面描画する")
+    parser.add_argument("--render_last_mesh", action="store_true", help="最後のメッシュ (地面等) を透過せずそのまま描画する")
     args = parser.parse_args()
 
     # 1. 入力パスの解決
@@ -45,20 +47,26 @@ def main():
     )
     print(f"読み込み完了: メッシュ数={len(meshes)}, ガウシアン点数={gaussian.get_xyz.shape[0]:,}, カメラ数={len(train_cams)}")
 
-    # 3. COLMAP カメラ視点から GLB メッシュをレンダリング
-    render_dir = project_dir / "output" / "renders"
+    # 3. COLMAP カメラ視点から GLB メッシュをレンダリング (オクルーダー版 & 非オクルーダー版の両方を出力)
+    occluded_dir = project_dir / "output" / "renders_occluded"
+    full_dir = project_dir / "output" / "renders_full"
     cam_indices = [args.cam_id] if args.cam_id is not None else None
     saved_paths = render_glb_from_cameras(
         meshes=meshes,
         cameras=train_cams,
-        output_dir=str(render_dir),
+        output_dir=str(occluded_dir),
+        full_output_dir=str(full_dir),
         cam_indices=cam_indices,
         flat=not args.shaded,
         alpha_mode=args.alpha_mode,
         alpha_cutoff=args.alpha_cutoff,
         depth_tolerance=args.depth_tolerance,
+        double_sided=args.double_sided,
+        occlude_last_mesh=not args.render_last_mesh,
     )
-    print(f"レンダリング完了: {len(saved_paths)} 枚を保存しました -> {render_dir}")
+    print(f"レンダリング完了: {len(saved_paths)} 枚ずつ保存しました")
+    print(f"  - オクルーダー版 (最後のメッシュ透過): {occluded_dir}")
+    print(f"  - 通常版 (全メッシュ描画)          : {full_dir}")
 
 
 if __name__ == "__main__":
