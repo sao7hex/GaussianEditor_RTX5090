@@ -143,7 +143,6 @@ def render_glb_from_cameras(
     alpha_mode: str = "BLEND",
     alpha_cutoff: float = 0.05,
     depth_tolerance: float = 0.0005,
-    double_sided: bool = False,
 ) -> List[Path]:
     """
     読み込んだ GLB メッシュ群を COLMAP カメラ視点からオフスクリーンレンダリングし、RGBA PNG として保存する。
@@ -188,8 +187,6 @@ def render_glb_from_cameras(
     flags = pyrender.RenderFlags.RGBA
     if flat:
         flags |= pyrender.RenderFlags.FLAT
-    if double_sided:
-        flags |= pyrender.RenderFlags.SKIP_CULL_FACES
 
     renderer = None
     current_size = None
