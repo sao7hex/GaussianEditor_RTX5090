@@ -18,12 +18,51 @@ def colmap_cam_to_opengl_pose(cam) -> np.ndarray:
     return (c2w @ opengl_fix).astype(np.float32)
 
 
+def _has_transparent_texture(geom: trimesh.Trimesh) -> bool:
+    """メッシュのテクスチャまたはマテリアルに透明領域が含まれているか判定する"""
+    mat = getattr(getattr(geom, "visual", None), "material", None)
+    if mat is None:
+        return False
+
+    base_factor = getattr(mat, "baseColorFactor", None)
+    if base_factor is not None and len(base_factor) >= 4 and float(base_factor[3]) < 1.0:
+        return True
+
+    tex = getattr(mat, "baseColorTexture", None) or getattr(mat, "image", None)
+    if tex is not None:
+        arr = np.asarray(tex)
+        if arr.ndim == 3 and arr.shape[2] >= 4 and int(arr[:, :, 3].min()) < 255:
+            return True
+    return False
+
+
+def _configure_transparency(
+    pr_mesh,
+    geom: trimesh.Trimesh,
+    alpha_mode: str = "MASK",
+    alpha_cutoff: float = 0.05,
+) -> None:
+    """透明領域を透明として出力するため、pyrender マテリアルの alphaMode を設定する"""
+    has_alpha = _has_transparent_texture(geom)
+    for prim in getattr(pr_mesh, "primitives", []):
+        mat = getattr(prim, "material", None)
+        if mat is None:
+            continue
+        current_mode = getattr(mat, "alphaMode", None)
+        if has_alpha or current_mode in ("MASK", "BLEND"):
+            mat.alphaMode = alpha_mode
+            if alpha_mode == "MASK":
+                mat.alphaCutoff = float(alpha_cutoff)
+
+
 def render_glb_from_cameras(
     meshes: List[Tuple[str, trimesh.Trimesh]],
     cameras: List,
     output_dir: str,
     cam_indices: Optional[List[int]] = None,
     flat: bool = True,
+    alpha_mode: str = "MASK",
+    alpha_cutoff: float = 0.05,
 ) -> List[Path]:
     """
     読み込んだ GLB メッシュ群を COLMAP カメラ視点からオフスクリーンレンダリングし、RGBA PNG として保存する。
@@ -44,6 +83,12 @@ def render_glb_from_cameras(
             continue
         try:
             pr_mesh = pyrender.Mesh.from_trimesh(geom, smooth=False)
+            _configure_transparency(
+                pr_mesh,
+                geom,
+                alpha_mode=alpha_mode,
+                alpha_cutoff=alpha_cutoff,
+            )
             pr_scene.add(pr_mesh, name=node_name)
             added_count += 1
         except Exception as e:
