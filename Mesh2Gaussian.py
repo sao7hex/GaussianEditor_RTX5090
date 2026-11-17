@@ -873,6 +873,7 @@ def prune_overlapping_gaussians(
     pipe: PipelineParams,
     mesh_bounds: Tuple[np.ndarray, np.ndarray],
     prune_margin: float = 0.02,
+    lateral_margin: float = 0.02,
     depth_tolerance: float = 0.005,
     max_cams_to_check: int = 10,
     mesh_gaussian: Optional[VanillaGaussianModel] = None,
@@ -974,8 +975,10 @@ def prune_overlapping_gaussians(
             scales_curr = base_gaussian.get_scaling.detach()  # 実空間での3軸スケール [N, 3]
             s_max, max_axis = scales_curr.max(dim=1)          # 最大軸の長さと軸インデックス (0, 1, 2)
 
+            max_margin = max(prune_margin, lateral_margin)
+
             # ガウシアンの楕円体がメッシュAABBに届き得る範囲で粗選抜
-            reach = prune_margin + 2.5 * s_max
+            reach = max_margin + 2.5 * s_max
             in_reach_bbox = (
                 (s_max > split_scale_thresh) &
                 (xyz_curr[:, 0] >= min_b_t[0] - reach) & (xyz_curr[:, 0] <= max_b_t[0] + reach) &
@@ -992,7 +995,7 @@ def prune_overlapping_gaussians(
 
             # デカール領域（面内: h_r * 1.8, 法線: -prune_margin 〜 +prune_margin）に楕円体が差し掛かる大ガウシアンを分割
             need_split_local = (
-                (d_par_r <= h_r * 1.8 + 2.0 * s_max_r) &
+                (d_par_r <= lateral_margin + 2.0 * s_max_r) &
                 (signed_perp_r >= -(prune_margin + 2.0 * s_max_r)) &
                 (signed_perp_r <= +(prune_margin + 2.0 * s_max_r))
             )
@@ -1052,7 +1055,7 @@ def prune_overlapping_gaussians(
         #    「法線方向は prune_margin 以内 (d_perp <= prune_margin)」の点のみを削除
         xyz = base_gaussian.get_xyz.detach()
         N = xyz.shape[0]
-        margin_vec = torch.tensor(prune_margin, device=device)
+        margin_vec = torch.tensor(max_margin, device=device)
         min_b_p = min_b_t - margin_vec
         max_b_p = max_b_t + margin_vec
 
@@ -1076,7 +1079,7 @@ def prune_overlapping_gaussians(
 
         # 横方向(d_parallel)はデカール格子間隔(h_nearest * 1.8)以内に制限し、外周の空白溝を防止
         # 垂直方向(signed_d_perp)は +prune_margin (表側・正方向) と -prune_margin (裏側・負方向) の両方向とも削除
-        in_decal_footprint = d_parallel <= torch.clamp(h_nearest * 1.8, min=0.001)
+        in_decal_footprint = d_parallel <= lateral_margin
         in_normal_both_dirs = (signed_d_perp >= -prune_margin) & (signed_d_perp <= +prune_margin)
         prune_mask_cand = in_decal_footprint & in_normal_both_dirs
 
