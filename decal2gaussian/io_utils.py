@@ -79,7 +79,13 @@ def load_glb(glb_path: str) -> List[Tuple[str, trimesh.Trimesh]]:
     return meshes
 
 
-def load_ply_and_colmap(ply_path: str, colmap_dir: str, work_dir: str, sh_degree: int = 3):
+def load_ply_and_colmap(
+    ply_path: str,
+    colmap_dir: str,
+    work_dir: str,
+    sh_degree: int = 3,
+    load_ply: bool = True,
+):
     """COLMAPカメラと指定PLYをロードして (gaussian, scene, cameras) を返す"""
     dummy_parser = argparse.ArgumentParser()
     lp = ModelParams(dummy_parser)
@@ -100,9 +106,10 @@ def load_ply_and_colmap(ply_path: str, colmap_dir: str, work_dir: str, sh_degree
         anchor_weight_multiplier=2.0,
     )
 
-    # load_iteration=None にして自動PLY探索をスキップし、指定PLYを直接ロード
+    # load_iteration=None にして自動PLY探索をスキップし、指定PLYを直接ロード (load_ply=False の場合は初期点群のまま)
     scene = Scene(args=model_params, gaussians=gaussian, load_iteration=None, shuffle=False)
-    gaussian.load_ply(ply_path)
+    if load_ply:
+        gaussian.load_ply(ply_path)
 
     n_pts = gaussian.get_xyz.shape[0]
     gaussian.max_radii2D = torch.zeros(n_pts, device="cuda")

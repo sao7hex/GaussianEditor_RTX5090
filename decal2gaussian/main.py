@@ -17,6 +17,8 @@ from io_utils import (
 )
 from mesh_renderer import render_glb_from_cameras
 from merge_renderer import merge_occluded_with_original_images
+from gs_trainer import train_3dgs_from_merged_images
+from train_runner import run_gaussiansplatting_train_py
 
 
 def main():
@@ -29,6 +31,10 @@ def main():
     parser.add_argument("--depth_tolerance", type=float, default=0.0005, help="同一平面判定の深度許容誤差 (デフォルト: 0.0005)")
     parser.add_argument("--double_sided", action="store_true", help="背面カリングを無効化し、法線が裏向きのポリゴンも両面描画する")
     parser.add_argument("--render_last_mesh", action="store_true", help="最後のメッシュ (地面等) を透過せずそのまま描画する")
+    parser.add_argument("--gs_iterations", type=int, default=3000, help="3DGS 学習ステップ数 (デフォルト: 3000)")
+    parser.add_argument("--from_scratch", action="store_true", help="既存PLYを使わず、COLMAP初期点群からゼロから3DGSを生成する")
+    parser.add_argument("--use_train_py", action="store_true", help="gaussiansplatting/train.py を呼び出して3DGSを生成する")
+    parser.add_argument("--skip_gs", action="store_true", help="3DGS学習をスキップし、レンダリングと画像合成のみ行う")
     args = parser.parse_args()
 
     # 1. 入力パスの解決
@@ -45,6 +51,7 @@ def main():
         ply_path=ply_path,
         colmap_dir=colmap_dir,
         work_dir=str(project_dir / "_cache"),
+        load_ply=not args.from_scratch,
     )
     print(f"読み込み完了: メッシュ数={len(meshes)}, ガウシアン点数={gaussian.get_xyz.shape[0]:,}, カメラ数={len(train_cams)}")
 
@@ -78,6 +85,32 @@ def main():
         cam_indices=cam_indices,
     )
     print(f"レイヤー合成完了: {len(merged_paths)} 枚を保存しました -> {merged_dir}")
+
+    # 5. renders_merged/ の画像で 3DGS シーンを生成・保存
+    if not args.skip_gs:
+        if args.use_train_py:
+            saved_ply = run_gaussiansplatting_train_py(
+                root_dir=ROOT_DIR,
+                colmap_dir=colmap_dir,
+                merged_dir=str(merged_dir),
+                cameras=train_cams,
+                work_dataset_dir=str(project_dir / "_cache" / "train_dataset"),
+                model_out_dir=str(project_dir / "output" / "train_py_model"),
+                iterations=args.gs_iterations,
+            )
+            print(f"train.py による 3DGS 生成完了: {saved_ply}")
+        else:
+            output_ply = project_dir / "output" / "point_cloud.ply"
+            saved_ply = train_3dgs_from_merged_images(
+                gaussian=gaussian,
+                scene=scene,
+                cameras=train_cams,
+                merged_dir=str(merged_dir),
+                output_ply_path=str(output_ply),
+                iterations=args.gs_iterations,
+                from_scratch=args.from_scratch,
+            )
+            print(f"3DGS 生成完了: {saved_ply}")
 
 
 if __name__ == "__main__":
