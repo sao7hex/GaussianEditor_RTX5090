@@ -23,7 +23,7 @@ def main():
     parser.add_argument("-p", "--project", type=str, required=True, help="projects/ 配下のプロジェクト名またはパス")
     parser.add_argument("--cam_id", type=int, default=None, help="特定のカメラIDのみレンダリングする場合に指定 (未指定時は全カメラ)")
     parser.add_argument("--shaded", action="store_true", help="ライティングあり (非フラット) でレンダリングする")
-    parser.add_argument("--alpha_mode", type=str, default="BLEND", choices=["MASK", "BLEND", "OPAQUE"], help="透明領域の描画モード (デフォルト: BLEND)")
+    parser.add_argument("--alpha_mode", type=str, default="MASK", choices=["MASK", "BLEND", "OPAQUE"], help="透明領域の描画モード (デフォルト: MASK)")
     parser.add_argument("--alpha_cutoff", type=float, default=0.05, help="MASKモード時の透明判定しきい値 (デフォルト: 0.05)")
     parser.add_argument("--depth_tolerance", type=float, default=0.0005, help="同一平面判定の深度許容誤差 (デフォルト: 0.0005)")
     args = parser.parse_args()

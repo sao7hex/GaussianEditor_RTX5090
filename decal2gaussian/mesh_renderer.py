@@ -47,7 +47,7 @@ def _split_submeshes_by_material(geom: trimesh.Trimesh, node_name: str) -> List[
 
 def _prepare_trimesh_for_pyrender(
     geom: trimesh.Trimesh,
-    alpha_mode: str = "BLEND",
+    alpha_mode: str = "MASK",
     alpha_cutoff: float = 0.05,
 ) -> Tuple[trimesh.Trimesh, bool]:
     """
@@ -140,9 +140,10 @@ def render_glb_from_cameras(
     output_dir: str,
     cam_indices: Optional[List[int]] = None,
     flat: bool = True,
-    alpha_mode: str = "BLEND",
+    alpha_mode: str = "MASK",
     alpha_cutoff: float = 0.05,
     depth_tolerance: float = 0.0005,
+    double_sided: bool = False,
 ) -> List[Path]:
     """
     読み込んだ GLB メッシュ群を COLMAP カメラ視点からオフスクリーンレンダリングし、RGBA PNG として保存する。
@@ -176,7 +177,7 @@ def render_glb_from_cameras(
                 else:
                     opaque_scene.add(pr_mesh, name=sub_name)
                     has_opaque = True
-                print(f"  [Mesh] '{sub_name}': faces={len(norm_geom.faces):,}, transparent={has_alpha}")
+                print(f"  [Mesh] '{sub_name}': faces={len(norm_geom.faces):,}, transparent={has_alpha}, alphaMode={alpha_mode if has_alpha else 'OPAQUE'}")
             except Exception as e:
                 print(f"  [Warning] メッシュ '{sub_name}' の pyrender 変換をスキップしました: {e}")
 
@@ -187,6 +188,8 @@ def render_glb_from_cameras(
     flags = pyrender.RenderFlags.RGBA
     if flat:
         flags |= pyrender.RenderFlags.FLAT
+    if double_sided:
+        flags |= pyrender.RenderFlags.SKIP_CULL_FACES
 
     renderer = None
     current_size = None
