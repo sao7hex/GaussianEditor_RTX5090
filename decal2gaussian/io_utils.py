@@ -32,14 +32,16 @@ def resolve_project_inputs(project_dir: Path) -> Tuple[str, str, str]:
         raise FileNotFoundError(f"入力フォルダが見つかりません: {input_dir}")
 
     # 1. .glb ファイルを検索
-    glb_files = sorted(input_dir.rglob("*.glb"))
+    glb_dir = input_dir / "mesh"
+    glb_files = sorted(glb_dir.rglob("*.glb"))
     if not glb_files:
         raise FileNotFoundError(f".glb が見つかりません: {input_dir}")
     glb_path = str(glb_files[0])
 
     # 2. .ply ファイルを検索 (COLMAPの sparse/ 配下にある points3D.ply 等は除外)
+    ply_dir = input_dir / "model"
     ply_files = sorted(
-        p for p in input_dir.rglob("*.ply")
+        p for p in ply_dir.rglob("*.ply")
         if "sparse" not in p.relative_to(input_dir).parts
     )
     if not ply_files:
