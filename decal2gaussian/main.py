@@ -16,6 +16,7 @@ from io_utils import (
     load_ply_and_colmap,
 )
 from mesh_renderer import render_glb_from_cameras
+from merge_renderer import merge_occluded_with_original_images
 
 
 def main():
@@ -67,6 +68,16 @@ def main():
     print(f"レンダリング完了: {len(saved_paths)} 枚ずつ保存しました")
     print(f"  - オクルーダー版 (最後のメッシュ透過): {occluded_dir}")
     print(f"  - 通常版 (全メッシュ描画)          : {full_dir}")
+
+    # 4. 元画像 (背面) とオクルーダー版レンダリング画像 (前面) を2Dレイヤー合成
+    merged_dir = project_dir / "output" / "renders_merged"
+    merged_paths = merge_occluded_with_original_images(
+        cameras=train_cams,
+        occluded_dir=str(occluded_dir),
+        output_dir=str(merged_dir),
+        cam_indices=cam_indices,
+    )
+    print(f"レイヤー合成完了: {len(merged_paths)} 枚を保存しました -> {merged_dir}")
 
 
 if __name__ == "__main__":
