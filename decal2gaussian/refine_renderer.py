@@ -28,13 +28,11 @@ def refine_Image_merge(wall_path, shape_path, opacity=0.9, displace_strength=1.5
     alpha = shape_displaced[:, :, 3]
 
     # 3. 溝の透過と「かすれ（経年劣化）」の生成
-    # ① 壁の暗い溝（レンガの目地や深いヒビ）は塗料が乗らないようにマスクを削る
+    # 壁の暗い溝（レンガの目地や深いヒビ）は塗料が乗らないようにマスクを削る
     crevice_mask = np.clip((wall_gray - 0.15) / 0.25, 0.0, 1.0)
 
-    # ② 壁のザラつきを利用したランダムなかすれ（ペンキの剥がれ）を作る
-    noise = np.random.normal(0.5, 0.2, (h, w)).astype(np.float32)
     # 壁の明暗とノイズを掛け合わせて不規則な剥がれマスクを生成
-    wear_mask = np.clip((wall_gray * 0.7 + noise * 0.3) - wear_amount, 0.0, 1.0)
+    wear_mask = np.clip(wall_gray - wear_amount, 0.0, 1.0)
     wear_mask = np.clip(wear_mask * 2.5, 0.0, 1.0) # コントラスト強調
 
     # マスクを統合し、エッジをわずかにぼかしてデジタル特有の硬さを消す
@@ -49,13 +47,8 @@ def refine_Image_merge(wall_path, shape_path, opacity=0.9, displace_strength=1.5
     lighting_map = np.expand_dims(wall_gray / local_mean, axis=2)
     lighting_map = np.clip(lighting_map, 0.45, 1.25)
 
-    # 5. 色温度の馴染ませ（環境光の影響を少しだけ与える）
-    # 壁全体の平均色を図形に10%だけブレンドして色浮きを防ぐ
-    env_color = np.mean(wall, axis=(0, 1))
-    harmonized_shape = shape_bgr * 0.9 + env_color * 0.1
-
     # 陰影を適用したペイント色
-    painted_bgr = harmonized_shape * lighting_map
+    painted_bgr = shape_bgr * lighting_map
 
     # 6. 最終合成
     result = wall * (1.0 - final_alpha) + painted_bgr * final_alpha
