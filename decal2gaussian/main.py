@@ -32,6 +32,7 @@ def main():
     parser.add_argument("--double_sided", action="store_true", help="背面カリングを無効化し、法線が裏向きのポリゴンも両面描画する")
     parser.add_argument("--render_last_mesh", action="store_true", help="最後のメッシュ (地面等) を透過せずそのまま描画する")
     parser.add_argument("--gs_iterations", type=int, default=3000, help="3DGS 学習ステップ数 (デフォルト: 3000)")
+    parser.add_argument("--no_refine", action="store_true", help="画像を結合するときに、refineせずに結合する")
     parser.add_argument("--from_scratch", action="store_true", help="既存PLYを使わず、COLMAP初期点群からゼロから3DGSを生成する")
     parser.add_argument("--use_train_py", action="store_true", help="gaussiansplatting/train.py を呼び出して3DGSを生成する")
     parser.add_argument("--skip_gs", action="store_true", help="3DGS学習をスキップし、レンダリングと画像合成のみ行う")
@@ -77,18 +78,23 @@ def main():
     print(f"  - 通常版 (全メッシュ描画)          : {full_dir}")
 
     # 4. 元画像 (背面) とオクルーダー版レンダリング画像 (前面) を2Dレイヤー合成
-    merged_dir = project_dir / "output" / "renders_merged"
+    if args.no_refine:
+        merged_dir = project_dir / "output" / "renders_not-refine_merged"
+    else:
+        merged_dir = project_dir / "output" / "renders_refine_merged"
     merged_paths = merge_occluded_with_original_images(
         cameras=train_cams,
         colmap_dir=colmap_dir,
         occluded_dir=str(occluded_dir),
         output_dir=str(merged_dir),
         cam_indices=cam_indices,
+        no_refine_Flag=args.no_refine
     )
     print(f"レイヤー合成完了: {len(merged_paths)} 枚を保存しました -> {merged_dir}")
 
     # 5. renders_merged/ の画像で 3DGS シーンを生成・保存
     if not args.skip_gs:
+        # --use_train_pyをオンにした時，train_runner.pyが動く
         if args.use_train_py:
             saved_ply = run_gaussiansplatting_train_py(
                 root_dir=ROOT_DIR,
@@ -100,6 +106,8 @@ def main():
                 iterations=args.gs_iterations,
             )
             print(f"train.py による 3DGS 生成完了: {saved_ply}")
+
+        # 何も指定していない・--from_scratchをオンにした時，gs_trainer.pyが動く
         else:
             output_ply = project_dir / "output" / "finetuned_model" / "point_cloud.ply"
             saved_ply = train_3dgs_from_merged_images(

@@ -23,6 +23,7 @@ def merge_occluded_with_original_images(
     occluded_dir: str,
     output_dir: str,
     cam_indices: Optional[List[int]] = None,
+    no_refine_Flag: bool = False
 ) -> List[Path]:
     """
     オクルーダー版レンダリング画像 (前面) と COLMAP の元画像 (背面) を
@@ -50,10 +51,21 @@ def merge_occluded_with_original_images(
         if not fg_path.exists() or bg_path is None or not bg_path.exists():
             continue
 
-        merged_bgr = refine_Image_merge(str(bg_path), str(fg_path))
-        merged_rgb = cv2.cvtColor(merged_bgr, cv2.COLOR_BGR2RGB)
         save_path = out_dir / filename
-        Image.fromarray(merged_rgb).save(save_path)
+        # 画像結合のrefineが無効の時
+        if no_refine_Flag:
+            fg_image = Image.open(fg_path).convert("RGBA")
+            bg_image = Image.open(bg_path).convert("RGBA")
+            if fg_image.size != bg_image.size:
+                bg_image = bg_image.resize(fg_image.size, Image.BILINEAR)
+            merged_image = Image.alpha_composite(bg_image, fg_image).convert("RGB")
+            merged_image.save(save_path)
+        #画像結合のrefineが有効の時
+        else:
+            merged_bgr = refine_Image_merge(str(bg_path), str(fg_path))
+            merged_rgb = cv2.cvtColor(merged_bgr, cv2.COLOR_BGR2RGB)
+            Image.fromarray(merged_rgb).save(save_path)
+        
         saved_paths.append(save_path)
 
     return saved_paths
