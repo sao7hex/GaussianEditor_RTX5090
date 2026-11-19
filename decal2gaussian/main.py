@@ -80,6 +80,7 @@ def main():
     merged_dir = project_dir / "output" / "renders_merged"
     merged_paths = merge_occluded_with_original_images(
         cameras=train_cams,
+        colmap_dir=colmap_dir,
         occluded_dir=str(occluded_dir),
         output_dir=str(merged_dir),
         cam_indices=cam_indices,
