@@ -27,7 +27,11 @@ def _load_merged_targets(cameras: List, merged_dir: str) -> List[Tuple[object, t
         if not img_path.exists():
             continue
 
-        img_np = np.asarray(Image.open(img_path).convert("RGB"), dtype=np.float32) / 255.0
+        img = Image.open(img_path).convert("RGB")
+        target_size = (int(cam.image_width), int(cam.image_height))
+        if img.size != target_size:
+            img = img.resize(target_size, Image.BILINEAR)
+        img_np = np.asarray(img, dtype=np.float32) / 255.0
         gt_tensor = torch.from_numpy(img_np).permute(2, 0, 1).contiguous().cuda()
         targets.append((cam, gt_tensor))
 
@@ -64,6 +68,8 @@ def train_3dgs_from_merged_images(
     gaussian.mask = torch.ones(n_pts, dtype=torch.bool, device="cuda")
     gaussian._generation = torch.zeros(n_pts, dtype=torch.int64, device="cuda")
     gaussian.training_setup(opt)
+    gaussian.apply_grad_mask(gaussian.mask)
+    gaussian.update_anchor()
 
     if from_scratch:
         gaussian.active_sh_degree = 0
@@ -99,7 +105,7 @@ def train_3dgs_from_merged_images(
                     gaussian.max_radii2D[visibility_filter],
                     radii[visibility_filter],
                 )
-                gaussian.add_densification_stats(viewspace_point_tensor, visibility_filter)
+                gaussian.add_densification_stats(viewspace_point_tensor.grad, visibility_filter)
 
                 if step >= densify_from and step % opt.densification_interval == 0:
                     gaussian.densify_and_prune(
