@@ -118,6 +118,7 @@ def main():
                 output_ply_path=str(output_ply),
                 iterations=args.gs_iterations,
                 from_scratch=args.from_scratch,
+                occluded_dir=str(occluded_dir),
             )
             print(f"3DGS 生成完了: {saved_ply}")
 
