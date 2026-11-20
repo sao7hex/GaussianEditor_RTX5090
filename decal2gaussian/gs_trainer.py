@@ -57,19 +57,7 @@ def train_3dgs_from_merged_images(
         print(f"  [Warning] 学習画像が {len(targets)} 枚しかありません。全カメラをレンダリングしてから実行することを推奨します。")
 
     dummy_parser = argparse.ArgumentParser()
-    if from_scratch:
-        opt = OptimizationParams(dummy_parser, max_steps=iterations)
-    else:
-        opt = OptimizationParams(
-            dummy_parser,
-            max_steps=iterations,
-            lr_scaler=0.2,
-            lr_final_scaler=0.2,
-            color_lr_scaler=0.3,
-            opacity_lr_scaler=0.2,
-            scaling_lr_scaler=0.3,
-            rotation_lr_scaler=0.3,
-        )
+    opt = OptimizationParams(dummy_parser, max_steps=iterations)
     pipe = PipelineParams(argparse.ArgumentParser())
     bg_color = torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32, device="cuda")
 
@@ -87,12 +75,10 @@ def train_3dgs_from_merged_images(
         gaussian.active_sh_degree = 0
         densify_from = min(500, iterations // 6)
         densify_until = int(iterations * 0.5)
-        densify_max_grad = opt.densify_grad_threshold
     else:
         gaussian.active_sh_degree = gaussian.max_sh_degree
         densify_from = min(200, iterations // 10)
-        densify_until = int(iterations * 0.4)
-        densify_max_grad = opt.densify_grad_threshold * 2.0
+        densify_until = int(iterations * 0.7)
 
     print(f"\n[3DGS Training] 画像数={len(targets)} 枚, ステップ数={iterations}, モード={'新規学習' if from_scratch else '既存PLYから追加学習'}")
 
@@ -123,7 +109,7 @@ def train_3dgs_from_merged_images(
 
                 if step >= densify_from and step % opt.densification_interval == 0:
                     gaussian.densify_and_prune(
-                        max_grad=densify_max_grad,
+                        max_grad=opt.densify_grad_threshold,
                         max_densify_percent=0.01,
                         min_opacity=0.005,
                         extent=cameras_extent,
